@@ -1,0 +1,27 @@
+[package]
+name = "file-crypto"
+version = "1.0.0"
+edition = "2021"
+description = "以 AES-256-GCM + Argon2id 進行單一檔案加解密的 Windows GUI 工具"
+build = "build.rs"
+
+[dependencies]
+eframe = "0.27"
+rfd = "0.14"
+aes-gcm = { version = "0.10", features = ["stream"] }
+argon2 = "0.5"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+anyhow = "1"
+
+# 只有在編譯 Windows 目標時才需要（嵌入 exe 圖示與版本資訊）
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+# 讓 release 版體積更小、無主控台視窗
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
