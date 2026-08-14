@@ -1,7 +1,7 @@
 [package]
 name = "file-crypto"
 version = "1.0.0"
-edition = "2021"
+edition = "2026"
 description = "以 AES-256-GCM + Argon2id 進行單一檔案加解密的 Windows GUI 工具"
 build = "build.rs"
 
