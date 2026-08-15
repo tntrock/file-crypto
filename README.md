@@ -26,19 +26,20 @@
 ### 前置需求
 - 安裝 [Rust 工具鏈](https://rustup.rs/)（含 `cargo`）。
 
-### 在 Windows 上直接編譯（最簡單）
+### 1. 在 Windows 上直接編譯（最簡單）
 ```powershell
 cd file-crypto
 cargo build --release
 ```
 產物：`target\release\file-crypto.exe`（雙擊即可執行，可自由複製到隨身碟）。
 
-### 從 Linux / macOS 交叉編譯成 Windows exe
+### 2. 從 Linux / macOS 交叉編譯成 Windows exe
 ```bash
 rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu
-# 產物：target/x86_64-pc-windows-gnu/release/file-crypto.exe
 ```
+產物：`target/x86_64-pc-windows-gnu/release/file-crypto.exe`
+
 （需安裝 MinGW-w64；Debian/Ubuntu：`sudo apt install mingw-w64`）
 
 ## 🧪 使用步驟
