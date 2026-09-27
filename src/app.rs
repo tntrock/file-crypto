@@ -372,10 +372,7 @@ fn confirm_overwrite(output: &Path) -> bool {
         .set_level(rfd::MessageLevel::Warning)
         .set_title("輸出檔已存在")
         .set_description(format!(
-            "以下檔案已存在：
-{}
-
-要在處理成功後覆蓋它嗎？（失敗時不會動到原檔）",
+            "以下檔案已存在：\n{}\n\n要在處理成功後覆蓋它嗎？（失敗時不會動到原檔）",
             output.display()
         ))
         .set_buttons(rfd::MessageButtons::YesNo)
