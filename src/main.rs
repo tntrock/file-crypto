@@ -8,10 +8,8 @@ use eframe::egui;
 
 fn main() -> eframe::Result<()> {
     // 載入視窗圖示（標題列／工作列）。解碼失敗時退回預設，不影響啟動。
-    let icon = eframe::icon_data::from_png_bytes(
-        include_bytes!("../assets/icon.png").as_slice(),
-    )
-    .unwrap_or_default();
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png").as_slice())
+        .unwrap_or_default();
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
