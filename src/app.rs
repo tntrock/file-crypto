@@ -162,7 +162,8 @@ impl EncryptorApp {
                     .spacing([12.0, 6.0])
                     .show(ui, |ui| {
                         ui.label("作者");
-                        ui.label(project::AUTHORS);
+                        ui.hyperlink_to(project::AUTHORS, project::AUTHOR_URL)
+                            .on_hover_text(project::AUTHOR_URL);
                         ui.end_row();
                         ui.label("授權");
                         ui.label(format!("{} License（開源、免費）", project::LICENSE));

@@ -5,6 +5,8 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 作者（Cargo.toml 的 authors）。
 pub const AUTHORS: &str = env!("CARGO_PKG_AUTHORS");
+/// 作者網站（Cargo.toml 沒有對應欄位，故在此定義）。
+pub const AUTHOR_URL: &str = "https://allenyen.net";
 /// 授權（Cargo.toml 的 license）。
 pub const LICENSE: &str = env!("CARGO_PKG_LICENSE");
 /// 官方原始碼網址（Cargo.toml 的 repository）。
@@ -66,7 +68,12 @@ mod tests {
 
     #[test]
     fn author_and_license_are_filled_in() {
-        assert_eq!(AUTHORS, "tntrock");
+        assert_eq!(AUTHORS, "Allen Yen");
         assert_eq!(LICENSE, "MIT");
+    }
+
+    #[test]
+    fn author_website() {
+        assert_eq!(AUTHOR_URL, "https://allenyen.net");
     }
 }
