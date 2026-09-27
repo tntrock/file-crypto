@@ -1325,11 +1325,12 @@ dependencies = [
 
 [[package]]
 name = "file-crypto"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
  "argon2",
+ "blake2",
  "eframe",
  "rand",
  "rfd",

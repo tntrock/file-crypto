@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use eframe::egui;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
-use crate::crypto::{self, Output, Progress, KEY_SOURCE_KEYFILE, KEY_SOURCE_PASSWORD};
+use crate::crypto::{self, Output, Progress, Secret, KEY_SOURCE_PASSWORD};
 
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {
@@ -20,6 +20,21 @@ enum Mode {
 enum KeyMode {
     Password,
     Keyfile,
+}
+
+/// 交給背景執行緒的金鑰來源。金鑰檔只傳路徑，由 crypto 模組以串流方式讀取。
+enum KeyInput {
+    Password(Zeroizing<Vec<u8>>),
+    Keyfile(PathBuf),
+}
+
+impl KeyInput {
+    fn as_secret(&self) -> Secret<'_> {
+        match self {
+            KeyInput::Password(p) => Secret::Password(p),
+            KeyInput::Keyfile(path) => Secret::Keyfile(path),
+        }
+    }
 }
 
 /// 由背景執行緒回報的最終結果。
@@ -92,10 +107,10 @@ impl EncryptorApp {
                         self.is_error = false;
                     }
                     self.known_name = info.original_name;
-                    self.key_mode = if info.key_source == KEY_SOURCE_KEYFILE {
-                        KeyMode::Keyfile
-                    } else {
+                    self.key_mode = if info.key_source == KEY_SOURCE_PASSWORD {
                         KeyMode::Password
+                    } else {
+                        KeyMode::Keyfile
                     };
                 }
             }
@@ -113,7 +128,7 @@ impl EncryptorApp {
         }
     }
 
-    fn validate(&self) -> Result<Vec<u8>, String> {
+    fn validate(&self) -> Result<KeyInput, String> {
         let Some(input) = &self.input_path else {
             return Err("尚未選擇輸入檔。".into());
         };
@@ -134,19 +149,21 @@ impl EncryptorApp {
                 if self.mode == Mode::Encrypt && self.password != self.password_confirm {
                     return Err("兩次輸入的密碼不一致。".into());
                 }
-                Ok(self.password.as_bytes().to_vec())
+                Ok(KeyInput::Password(Zeroizing::new(
+                    self.password.as_bytes().to_vec(),
+                )))
             }
             KeyMode::Keyfile => {
                 let Some(kf) = &self.keyfile_path else {
                     return Err("尚未選擇金鑰檔。".into());
                 };
-                std::fs::read(kf).map_err(|e| format!("讀取金鑰檔失敗: {e}"))
+                Ok(KeyInput::Keyfile(kf.clone()))
             }
         }
     }
 
     fn start_job(&mut self, ctx: &egui::Context) {
-        let mut material = match self.validate() {
+        let key = match self.validate() {
             Ok(m) => m,
             Err(e) => {
                 self.status = e;
@@ -162,16 +179,11 @@ impl EncryptorApp {
         // 自動命名模式永遠不覆蓋，不需詢問。
         let overwrite = matches!(&output, Output::File(p) if p.exists());
         if overwrite && !confirm_overwrite(output.path()) {
-            material.zeroize();
             self.status = "已取消：輸出檔已存在。".to_owned();
             self.is_error = true;
             return;
         }
         let mode = self.mode;
-        let key_source = match self.key_mode {
-            KeyMode::Password => KEY_SOURCE_PASSWORD,
-            KeyMode::Keyfile => KEY_SOURCE_KEYFILE,
-        };
 
         *self.result.lock().unwrap() = None;
         self.running.store(true, Ordering::Relaxed);
@@ -188,17 +200,16 @@ impl EncryptorApp {
                 Mode::Encrypt => crypto::encrypt_file(
                     &input,
                     output.path(),
-                    &material,
-                    key_source,
+                    &key.as_secret(),
                     overwrite,
                     &progress,
                 )
                 .map(|()| output.path().to_path_buf()),
                 Mode::Decrypt => {
-                    crypto::decrypt_file(&input, &output, &material, overwrite, &progress)
+                    crypto::decrypt_file(&input, &output, &key.as_secret(), overwrite, &progress)
                 }
             };
-            material.zeroize();
+            drop(key); // 密碼副本在此清零
 
             let msg = match outcome {
                 Ok(written) => Ok(format!("完成！已輸出至：\n{}", written.display())),

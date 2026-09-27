@@ -1,6 +1,6 @@
 [package]
 name = "file-crypto"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "以 AES-256-GCM + Argon2id 進行單一檔案加解密的 Windows GUI 工具"
 build = "build.rs"
@@ -13,6 +13,7 @@ argon2 = "0.5"
 rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
 anyhow = "1"
+blake2 = "0.10"
 tempfile = "3"
 
 # 只有在編譯 Windows 目標時才需要（嵌入 exe 圖示與版本資訊）

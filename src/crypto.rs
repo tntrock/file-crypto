@@ -7,7 +7,7 @@
 //! │ 0          │ 6    │ Magic  = b"RFENC1"                             │
 //! │ 6          │ 1    │ 版本   (VERSION = 2)                           │
 //! │ 7          │ 1    │ 演算法 (1 = AES-256-GCM / STREAM BE32)         │
-//! │ 8          │ 1    │ 金鑰來源 (0 = 密碼, 1 = 金鑰檔)                │
+//! │ 8          │ 1    │ 金鑰來源 (0 = 密碼, 1 = 舊式金鑰檔, 2 = 金鑰檔雜湊)│
 //! │ 9          │ 4    │ Argon2 m_cost (KiB)                            │
 //! │ 13         │ 4    │ Argon2 t_cost (迭代次數)                       │
 //! │ 17         │ 4    │ Argon2 p_cost (平行度)                         │
@@ -36,6 +36,7 @@ use aes_gcm::aead::Payload;
 use aes_gcm::{Aes256Gcm, KeyInit};
 use anyhow::{anyhow, bail, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
+use blake2::{Blake2b512, Digest};
 use rand::RngCore;
 use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
@@ -45,8 +46,12 @@ const VERSION: u8 = 2;
 const VERSION_V1: u8 = 1;
 const ALG_AES256GCM: u8 = 1;
 
+/// 金鑰來源代碼（記錄在標頭，決定解密時如何從使用者輸入產生 Argon2 的輸入）。
 pub const KEY_SOURCE_PASSWORD: u8 = 0;
+/// 舊式金鑰檔（≤ v1.1.0）：直接以整個金鑰檔內容作為 Argon2 輸入，需整檔讀入記憶體。
 pub const KEY_SOURCE_KEYFILE: u8 = 1;
+/// 金鑰檔（v1.2.0 起）：以 BLAKE2b-512 串流雜湊金鑰檔，雜湊值作為 Argon2 輸入。
+pub const KEY_SOURCE_KEYFILE_HASH: u8 = 2;
 
 /// 標頭內的檔名不可用時，改用這個名稱。
 pub const FALLBACK_NAME: &str = "decrypted";
@@ -105,6 +110,12 @@ pub struct HeaderInfo {
     /// v2 起檔名經過加密，解密前無法得知，此時為 None。
     pub original_name: Option<String>,
     pub key_source: u8,
+}
+
+/// 使用者提供的金鑰來源。
+pub enum Secret<'a> {
+    Password(&'a [u8]),
+    Keyfile(&'a Path),
 }
 
 /// 解密輸出位置。
@@ -225,6 +236,12 @@ fn read_header<R: Read>(inner: &mut R) -> Result<Header> {
     }
     if alg != ALG_AES256GCM {
         bail!("不支援的演算法代碼: {alg}");
+    }
+    if !matches!(
+        key_source,
+        KEY_SOURCE_PASSWORD | KEY_SOURCE_KEYFILE | KEY_SOURCE_KEYFILE_HASH
+    ) {
+        bail!("不支援的金鑰來源代碼: {key_source}（請更新本工具）");
     }
     let m_cost = u32::from_le_bytes(read_array(&mut r)?);
     let t_cost = u32::from_le_bytes(read_array(&mut r)?);
@@ -369,8 +386,7 @@ fn commit_unique(tmp: NamedTempFile, dir: &Path, name: &str) -> Result<PathBuf> 
 pub fn encrypt_file(
     input: &Path,
     output: &Path,
-    material: &[u8],
-    key_source: u8,
+    secret: &Secret,
     overwrite: bool,
     progress: &Progress,
 ) -> Result<()> {
@@ -378,9 +394,7 @@ pub fn encrypt_file(
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("output");
-    encrypt_with_name(
-        input, output, name, material, key_source, overwrite, progress,
-    )
+    encrypt_with_name(input, output, name, secret, overwrite, progress)
 }
 
 /// 加密單一檔案，並把 `name` 當作原始檔名加密存入。
@@ -388,11 +402,15 @@ fn encrypt_with_name(
     input: &Path,
     output: &Path,
     name: &str,
-    material: &[u8],
-    key_source: u8,
+    secret: &Secret,
     overwrite: bool,
     progress: &Progress,
 ) -> Result<()> {
+    let key_source = match secret {
+        Secret::Password(_) => KEY_SOURCE_PASSWORD,
+        Secret::Keyfile(_) => KEY_SOURCE_KEYFILE_HASH,
+    };
+    let material = key_material(key_source, secret)?;
     if name.len() > u16::MAX as usize {
         bail!("檔名過長");
     }
@@ -413,7 +431,7 @@ fn encrypt_with_name(
     rng.fill_bytes(&mut salt);
     rng.fill_bytes(&mut nonce_prefix);
 
-    let key = derive_key(material, &salt, ARGON_M_COST, ARGON_T_COST, ARGON_P_COST)?;
+    let key = derive_key(&material, &salt, ARGON_M_COST, ARGON_T_COST, ARGON_P_COST)?;
     let header = build_header(key_source, &salt, &nonce_prefix);
 
     let mut writer = BufWriter::new(tmp.as_file_mut());
@@ -469,7 +487,7 @@ pub fn peek_header(input: &Path) -> Result<HeaderInfo> {
 pub fn decrypt_file(
     input: &Path,
     output: &Output,
-    material: &[u8],
+    secret: &Secret,
     overwrite: bool,
     progress: &Progress,
 ) -> Result<PathBuf> {
@@ -489,8 +507,9 @@ pub fn decrypt_file(
     };
     let mut tmp = temp_in(out_dir)?;
 
+    let material = key_material(header.key_source, secret)?;
     let key = derive_key(
-        material,
+        &material,
         &header.salt,
         header.m_cost,
         header.t_cost,
@@ -548,6 +567,40 @@ pub fn decrypt_file(
     }
 }
 
+/// 以 BLAKE2b-512 串流雜湊金鑰檔，不論金鑰檔多大都只佔用固定記憶體。
+fn hash_keyfile(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
+    let mut file = File::open(path).map_err(|e| anyhow!("讀取金鑰檔失敗: {e}"))?;
+    let mut hasher = Blake2b512::new();
+    let mut buf = Zeroizing::new(vec![0u8; PLAIN_CHUNK]);
+    let mut total: u64 = 0;
+    loop {
+        let n = read_up_to(&mut file, &mut buf).map_err(|e| anyhow!("讀取金鑰檔失敗: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    if total == 0 {
+        bail!("金鑰檔是空的，請選擇其他檔案");
+    }
+    Ok(Zeroizing::new(hasher.finalize().to_vec()))
+}
+
+/// 依標頭記錄的金鑰來源，把使用者輸入轉成 Argon2 的輸入。
+fn key_material(key_source: u8, secret: &Secret) -> Result<Zeroizing<Vec<u8>>> {
+    match (key_source, secret) {
+        (KEY_SOURCE_PASSWORD, Secret::Password(p)) => Ok(Zeroizing::new(p.to_vec())),
+        (KEY_SOURCE_KEYFILE_HASH, Secret::Keyfile(path)) => hash_keyfile(path),
+        (KEY_SOURCE_KEYFILE, Secret::Keyfile(path)) => Ok(Zeroizing::new(
+            std::fs::read(path).map_err(|e| anyhow!("讀取金鑰檔失敗: {e}"))?,
+        )),
+        (KEY_SOURCE_PASSWORD, Secret::Keyfile(_)) => bail!("此檔案是用密碼加密的，請改輸入密碼"),
+        (_, Secret::Password(_)) => bail!("此檔案是用金鑰檔加密的，請改選擇金鑰檔"),
+        _ => bail!("不支援的金鑰來源代碼: {key_source}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,8 +618,7 @@ mod tests {
         encrypt_file(
             input,
             output,
-            PW,
-            KEY_SOURCE_PASSWORD,
+            &Secret::Password(PW),
             false,
             &Progress::default(),
         )
@@ -577,7 +629,7 @@ mod tests {
         decrypt_file(
             input,
             &Output::File(output.to_path_buf()),
-            pw,
+            &Secret::Password(pw),
             overwrite,
             &Progress::default(),
         )
@@ -587,7 +639,7 @@ mod tests {
         decrypt_file(
             input,
             &Output::AutoName(dir.to_path_buf()),
-            PW,
+            &Secret::Password(PW),
             false,
             &Progress::default(),
         )
@@ -695,8 +747,7 @@ mod tests {
         let res = encrypt_file(
             &input,
             &enc,
-            PW,
-            KEY_SOURCE_PASSWORD,
+            &Secret::Password(PW),
             false,
             &Progress::default(),
         );
@@ -722,8 +773,7 @@ mod tests {
         let res = encrypt_file(
             &input,
             &input,
-            PW,
-            KEY_SOURCE_PASSWORD,
+            &Secret::Password(PW),
             true,
             &Progress::default(),
         );
@@ -905,8 +955,7 @@ mod tests {
             &input,
             &enc,
             r"..\..\evil.txt",
-            PW,
-            KEY_SOURCE_PASSWORD,
+            &Secret::Password(PW),
             false,
             &Progress::default(),
         )
@@ -925,7 +974,7 @@ mod tests {
         let res = decrypt_file(
             &enc,
             &Output::AutoName(dir.path().into()),
-            b"wrong",
+            &Secret::Password(b"wrong"),
             false,
             &Progress::default(),
         );
@@ -959,5 +1008,169 @@ mod tests {
         let out = decrypt_auto(&enc, dir.path()).unwrap();
         assert_eq!(out, dir.path().join("v1 範例.txt"));
         assert_eq!(fs::read_to_string(&out).unwrap(), V1_CONTENT);
+    }
+
+    // ---- 金鑰檔 ----
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    fn encrypt_with_keyfile(dir: &Path, keyfile: &Path) -> PathBuf {
+        let input = write(dir, "a.txt", b"keyfile protected");
+        let enc = dir.join("a.txt.enc");
+        encrypt_file(
+            &input,
+            &enc,
+            &Secret::Keyfile(keyfile),
+            false,
+            &Progress::default(),
+        )
+        .unwrap();
+        fs::remove_file(&input).unwrap();
+        enc
+    }
+
+    #[test]
+    fn keyfile_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let kf = write(dir.path(), "key.jpg", &vec![0x5A; PLAIN_CHUNK * 2 + 123]);
+        let enc = encrypt_with_keyfile(dir.path(), &kf);
+        let out = decrypt_file(
+            &enc,
+            &Output::AutoName(dir.path().into()),
+            &Secret::Keyfile(&kf),
+            false,
+            &Progress::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(out).unwrap(), b"keyfile protected");
+    }
+
+    #[test]
+    fn new_keyfile_encryption_uses_hashed_key_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let kf = write(dir.path(), "key.bin", b"some key material");
+        let enc = encrypt_with_keyfile(dir.path(), &kf);
+        assert_eq!(
+            peek_header(&enc).unwrap().key_source,
+            KEY_SOURCE_KEYFILE_HASH
+        );
+    }
+
+    #[test]
+    fn keyfile_digest_matches_blake2b_of_whole_file() {
+        use blake2::{Blake2b512, Digest};
+        let dir = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..PLAIN_CHUNK * 3 + 7).map(|i| (i % 251) as u8).collect();
+        let kf = write(dir.path(), "big.bin", &data);
+        assert_eq!(
+            hash_keyfile(&kf).unwrap().as_slice(),
+            Blake2b512::digest(&data).as_slice()
+        );
+    }
+
+    #[test]
+    fn different_keyfile_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let kf = write(dir.path(), "key.bin", b"original key");
+        let enc = encrypt_with_keyfile(dir.path(), &kf);
+        let other = write(dir.path(), "other.bin", b"original kez");
+        let res = decrypt_file(
+            &enc,
+            &Output::AutoName(dir.path().into()),
+            &Secret::Keyfile(&other),
+            false,
+            &Progress::default(),
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn empty_keyfile_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let kf = write(dir.path(), "empty.bin", b"");
+        let input = write(dir.path(), "a.txt", b"data");
+        let err = encrypt_file(
+            &input,
+            &dir.path().join("a.enc"),
+            &Secret::Keyfile(&kf),
+            false,
+            &Progress::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("金鑰檔是空的"), "{err}");
+    }
+
+    #[test]
+    fn legacy_raw_keyfile_file_still_decrypts() {
+        // 由 v1.1.0 以「金鑰來源 = 1（直接使用金鑰檔內容）」產生
+        let dir = tempfile::tempdir().unwrap();
+        let enc = dir.path().join("legacy.enc");
+        fs::copy(fixture("v2_keyfile_legacy.enc"), &enc).unwrap();
+        assert_eq!(peek_header(&enc).unwrap().key_source, KEY_SOURCE_KEYFILE);
+        let kf = fixture("keyfile.bin");
+        let out = decrypt_file(
+            &enc,
+            &Output::AutoName(dir.path().into()),
+            &Secret::Keyfile(&kf),
+            false,
+            &Progress::default(),
+        )
+        .unwrap();
+        assert_eq!(out, dir.path().join("v2 金鑰檔範例.txt"));
+        assert_eq!(
+            fs::read_to_string(out).unwrap(),
+            "這是用金鑰檔加密的 v2 範例內容。\n"
+        );
+    }
+
+    #[test]
+    fn password_given_for_keyfile_encrypted_file_explains_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let kf = write(dir.path(), "key.bin", b"k");
+        let enc = encrypt_with_keyfile(dir.path(), &kf);
+        let err = decrypt_file(
+            &enc,
+            &Output::AutoName(dir.path().into()),
+            &Secret::Password(PW),
+            false,
+            &Progress::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("請改選擇金鑰檔"), "{err}");
+    }
+
+    #[test]
+    fn keyfile_given_for_password_encrypted_file_explains_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write(dir.path(), "a.txt", b"data");
+        let enc = dir.path().join("a.txt.enc");
+        encrypt(&input, &enc);
+        let kf = write(dir.path(), "key.bin", b"k");
+        let err = decrypt_file(
+            &enc,
+            &Output::AutoName(dir.path().into()),
+            &Secret::Keyfile(&kf),
+            false,
+            &Progress::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("請改輸入密碼"), "{err}");
+    }
+
+    #[test]
+    fn unknown_key_source_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write(dir.path(), "a.txt", b"data");
+        let enc = dir.path().join("a.txt.enc");
+        encrypt(&input, &enc);
+        let mut bytes = fs::read(&enc).unwrap();
+        bytes[8] = 99;
+        fs::write(&enc, bytes).unwrap();
+        let err = peek_header(&enc).err().expect("應該失敗");
+        assert!(err.to_string().contains("不支援的金鑰來源"), "{err}");
     }
 }
