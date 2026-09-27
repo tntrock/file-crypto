@@ -1,13 +1,14 @@
 //! egui GUI 應用層
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use eframe::egui;
 use zeroize::Zeroizing;
 
+use crate::batch::{self, Destination, Operation};
 use crate::crypto::{self, Output, Progress, Secret, KEY_SOURCE_PASSWORD};
 use crate::project;
 use crate::update::{self, Release, Settings, CURRENT_VERSION};
@@ -56,8 +57,12 @@ pub struct EncryptorApp {
     mode: Mode,
     key_mode: KeyMode,
 
-    input_path: Option<PathBuf>,
+    /// 輸入檔。一個檔案時為單檔模式；多個檔案時為批次模式。
+    inputs: Vec<PathBuf>,
+    /// 單檔模式的輸出位置。
     output: Option<Output>,
+    /// 批次模式的輸出位置。
+    batch_dest: Destination,
     /// 解密前就能得知的原始檔名（只有 v1 檔案才有），僅供顯示。
     known_name: Option<String>,
     keyfile_path: Option<PathBuf>,
@@ -73,6 +78,9 @@ pub struct EncryptorApp {
     progress: Arc<Progress>,
     running: Arc<AtomicBool>,
     result: JobResult,
+    /// 批次模式：目前處理到第幾個檔案（從 0 起算）與總數。
+    batch_index: Arc<AtomicUsize>,
+    batch_total: usize,
 
     settings: Settings,
     update: Arc<Mutex<UpdateState>>,
@@ -85,8 +93,9 @@ impl EncryptorApp {
         let app = Self {
             mode: Mode::Encrypt,
             key_mode: KeyMode::Password,
-            input_path: None,
+            inputs: Vec::new(),
             output: None,
+            batch_dest: Destination::SameAsInput,
             known_name: None,
             keyfile_path: None,
             password: String::new(),
@@ -97,6 +106,8 @@ impl EncryptorApp {
             progress: Arc::new(Progress::default()),
             running: Arc::new(AtomicBool::new(false)),
             result: Arc::new(Mutex::new(None)),
+            batch_index: Arc::new(AtomicUsize::new(0)),
+            batch_total: 0,
             settings: Settings::load(),
             update: Arc::new(Mutex::new(UpdateState::Idle)),
             show_about: false,
@@ -154,7 +165,7 @@ impl EncryptorApp {
             .show(ctx, |ui| {
                 ui.heading("🔐 檔案加解密工具");
                 ui.label(format!("版本 v{}", project::VERSION));
-                ui.label("以 AES-256-GCM + Argon2id 加解密單一檔案的免安裝工具。");
+                ui.label("以 AES-256-GCM + Argon2id 加解密檔案的免安裝工具。");
                 ui.separator();
 
                 egui::Grid::new("about_grid")
@@ -243,9 +254,34 @@ impl EncryptorApp {
         });
     }
 
+    fn is_batch(&self) -> bool {
+        self.inputs.len() > 1
+    }
+
+    /// 設定輸入檔（來自檔案對話框或拖放）。資料夾目前不支援，會被略過。
+    fn set_inputs(&mut self, paths: Vec<PathBuf>) {
+        let (files, dirs): (Vec<PathBuf>, Vec<PathBuf>) =
+            paths.into_iter().partition(|p| !p.is_dir());
+        let mut files = files;
+        files.dedup();
+        if !dirs.is_empty() {
+            self.status = format!("已略過 {} 個資料夾：目前只支援選擇檔案。", dirs.len());
+            self.is_error = true;
+        }
+        if files.is_empty() {
+            return;
+        }
+        if dirs.is_empty() {
+            self.status.clear();
+            self.is_error = false;
+        }
+        self.inputs = files;
+        self.suggest_output();
+    }
+
     /// 依模式與輸入檔，推算預設輸出位置。
     fn suggest_output(&mut self) {
-        let Some(input) = self.input_path.clone() else {
+        let Some(input) = self.inputs.first().cloned() else {
             return;
         };
         self.known_name = None;
@@ -259,7 +295,7 @@ impl EncryptorApp {
                 // 預設輸出到同一資料夾，檔名使用加密檔內記錄的原始檔名
                 self.output = Some(Output::AutoName(parent_dir(&input)));
                 if let Ok(info) = crypto::peek_header(&input) {
-                    if info.version == 1 {
+                    if info.version == 1 && self.inputs.len() == 1 {
                         self.status = "提示：這是舊版（v1）加密檔，標頭未受保護且檔名未加密；\
                                        建議解密後用新版重新加密。"
                             .to_owned();
@@ -288,10 +324,11 @@ impl EncryptorApp {
     }
 
     fn validate(&self) -> Result<KeyInput, String> {
-        let Some(input) = &self.input_path else {
+        let Some(input) = self.inputs.first() else {
             return Err("尚未選擇輸入檔。".into());
         };
         match (&self.output, self.mode) {
+            _ if self.is_batch() => {}
             (None, _) | (Some(Output::AutoName(_)), Mode::Encrypt) => {
                 return Err("尚未指定輸出檔。".into());
             }
@@ -331,7 +368,12 @@ impl EncryptorApp {
             }
         };
 
-        let input = self.input_path.clone().unwrap();
+        if self.is_batch() {
+            self.start_batch(ctx, key);
+            return;
+        }
+
+        let input = self.inputs[0].clone();
         let output = self.output.clone().unwrap();
 
         // 指定的輸出檔已存在時先詢問；只有成功完成才會真的取代它。
@@ -344,11 +386,7 @@ impl EncryptorApp {
         }
         let mode = self.mode;
 
-        *self.result.lock().unwrap() = None;
-        self.running.store(true, Ordering::Relaxed);
-        self.is_error = false;
-        self.status = "處理中…".to_owned();
-
+        self.begin_job();
         let progress = self.progress.clone();
         let running = self.running.clone();
         let result = self.result.clone();
@@ -380,6 +418,52 @@ impl EncryptorApp {
             ctx.request_repaint();
         });
     }
+
+    /// 單檔與批次共用的開始處理前準備。
+    fn begin_job(&mut self) {
+        *self.result.lock().unwrap() = None;
+        // 取消旗標由這裡統一清除（crypto 模組刻意不清除，見 Progress::reset）
+        self.progress.cancel.store(false, Ordering::Relaxed);
+        self.batch_index.store(0, Ordering::Relaxed);
+        self.batch_total = self.inputs.len();
+        self.running.store(true, Ordering::Relaxed);
+        self.is_error = false;
+        self.status = "處理中…".to_owned();
+    }
+
+    /// 批次模式：逐一處理所有輸入檔，一律自動命名、不覆蓋。
+    fn start_batch(&mut self, ctx: &egui::Context, key: KeyInput) {
+        self.begin_job();
+        let op = match self.mode {
+            Mode::Encrypt => Operation::Encrypt,
+            Mode::Decrypt => Operation::Decrypt,
+        };
+        let inputs = self.inputs.clone();
+        let dest = self.batch_dest.clone();
+        let progress = self.progress.clone();
+        let running = self.running.clone();
+        let result = self.result.clone();
+        let index = self.batch_index.clone();
+        let ctx = ctx.clone();
+
+        thread::spawn(move || {
+            let report = batch::run(op, &inputs, &dest, &key.as_secret(), &progress, |i| {
+                index.store(i, Ordering::Relaxed);
+            });
+            drop(key); // 密碼副本在此清零
+            let (text, is_error) = report.summary(op, inputs.len());
+            *result.lock().unwrap() = Some(if is_error { Err(text) } else { Ok(text) });
+            running.store(false, Ordering::Relaxed);
+            ctx.request_repaint();
+        });
+    }
+
+    fn batch_dest_label(&self) -> String {
+        match &self.batch_dest {
+            Destination::SameAsInput => "各自所在的資料夾".to_owned(),
+            Destination::Folder(dir) => dir.display().to_string(),
+        }
+    }
 }
 
 impl eframe::App for EncryptorApp {
@@ -399,6 +483,21 @@ impl eframe::App for EncryptorApp {
         }
         let running = self.running.load(Ordering::Relaxed);
 
+        // 拖放檔案
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty() && !running {
+            self.set_inputs(dropped);
+        }
+        if !running && ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            paint_drop_overlay(ctx);
+        }
+
         let update_state = self.update.lock().unwrap().clone();
         if let UpdateState::Available(release) = &update_state {
             self.update_banner(ctx, release);
@@ -410,7 +509,7 @@ impl eframe::App for EncryptorApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("🔐 檔案加解密工具");
-            ui.label("AES-256-GCM ｜ 單一檔案 ｜ 免安裝可攜版");
+            ui.label("AES-256-GCM ｜ 支援多檔案 ｜ 免安裝可攜版");
             ui.separator();
 
             ui.add_enabled_ui(!running, |ui| {
@@ -438,50 +537,99 @@ impl eframe::App for EncryptorApp {
                 // 輸入檔
                 ui.horizontal(|ui| {
                     if ui.button("選擇輸入檔…").clicked() {
-                        if let Some(p) = rfd::FileDialog::new().pick_file() {
-                            self.input_path = Some(p);
+                        if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                            self.set_inputs(paths);
+                        }
+                    }
+                    match self.inputs.as_slice() {
+                        [] => {
+                            ui.label("（未選擇）");
+                        }
+                        [one] => {
+                            ui.label(one.display().to_string());
+                        }
+                        many => {
+                            ui.label(format!("已選擇 {} 個檔案", many.len()));
+                        }
+                    }
+                    if !self.inputs.is_empty() && ui.small_button("清除").clicked() {
+                        self.inputs.clear();
+                        self.output = None;
+                    }
+                });
+                if self.is_batch() {
+                    egui::CollapsingHeader::new("檔案清單")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .max_height(120.0)
+                                .show(ui, |ui| {
+                                    for p in &self.inputs {
+                                        ui.label(p.display().to_string());
+                                    }
+                                });
+                        });
+                } else {
+                    ui.label(
+                        egui::RichText::new("可一次選擇多個檔案，或直接把檔案拖進視窗。")
+                            .small()
+                            .italics(),
+                    );
+                }
+
+                // 輸出位置（批次）
+                if self.is_batch() {
+                    ui.horizontal(|ui| {
+                        if ui.button("輸出資料夾…").clicked() {
+                            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                self.batch_dest = Destination::Folder(dir);
+                            }
+                        }
+                        if matches!(self.batch_dest, Destination::Folder(_))
+                            && ui.button("改回各自資料夾").clicked()
+                        {
+                            self.batch_dest = Destination::SameAsInput;
+                        }
+                        ui.label(format!(
+                            "{}（同名時自動加編號，不會覆蓋）",
+                            self.batch_dest_label()
+                        ));
+                    });
+                }
+
+                // 輸出檔（單檔）
+                if !self.is_batch() {
+                    ui.horizontal(|ui| {
+                        if ui.button("輸出位置…").clicked() {
+                            let mut dlg = rfd::FileDialog::new();
+                            match &self.output {
+                                Some(Output::File(p)) => {
+                                    if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                                        dlg = dlg.set_file_name(name);
+                                    }
+                                    dlg = dlg.set_directory(parent_dir(p));
+                                }
+                                Some(Output::AutoName(dir)) => {
+                                    if let Some(name) = &self.known_name {
+                                        dlg = dlg.set_file_name(name);
+                                    }
+                                    dlg = dlg.set_directory(dir);
+                                }
+                                None => {}
+                            }
+                            if let Some(p) = dlg.save_file() {
+                                self.output = Some(Output::File(p));
+                            }
+                        }
+                        if self.mode == Mode::Decrypt
+                            && matches!(self.output, Some(Output::File(_)))
+                            && ui.button("使用原始檔名").clicked()
+                        {
                             self.suggest_output();
                         }
-                    }
-                    let txt = self
-                        .input_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "（未選擇）".into());
-                    ui.label(txt);
-                });
-
-                // 輸出檔
-                ui.horizontal(|ui| {
-                    if ui.button("輸出位置…").clicked() {
-                        let mut dlg = rfd::FileDialog::new();
-                        match &self.output {
-                            Some(Output::File(p)) => {
-                                if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                                    dlg = dlg.set_file_name(name);
-                                }
-                                dlg = dlg.set_directory(parent_dir(p));
-                            }
-                            Some(Output::AutoName(dir)) => {
-                                if let Some(name) = &self.known_name {
-                                    dlg = dlg.set_file_name(name);
-                                }
-                                dlg = dlg.set_directory(dir);
-                            }
-                            None => {}
-                        }
-                        if let Some(p) = dlg.save_file() {
-                            self.output = Some(Output::File(p));
-                        }
-                    }
-                    if self.mode == Mode::Decrypt
-                        && matches!(self.output, Some(Output::File(_)))
-                        && ui.button("使用原始檔名").clicked()
-                    {
-                        self.suggest_output();
-                    }
-                    ui.label(self.output_label());
-                });
+                        ui.label(self.output_label());
+                    });
+                }
 
                 ui.separator();
 
@@ -555,8 +703,30 @@ impl eframe::App for EncryptorApp {
             // 進度與取消
             if running {
                 ui.add_space(8.0);
-                let frac = self.progress.fraction();
-                ui.add(egui::ProgressBar::new(frac).show_percentage().animate(true));
+                let file_frac = self.progress.fraction();
+                if self.batch_total > 1 {
+                    let i = self
+                        .batch_index
+                        .load(Ordering::Relaxed)
+                        .min(self.batch_total - 1);
+                    let name = self.inputs[i]
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    ui.label(format!("第 {}／{} 個：{name}", i + 1, self.batch_total));
+                    let overall = (i as f32 + file_frac) / self.batch_total as f32;
+                    ui.add(
+                        egui::ProgressBar::new(overall)
+                            .show_percentage()
+                            .animate(true),
+                    );
+                } else {
+                    ui.add(
+                        egui::ProgressBar::new(file_frac)
+                            .show_percentage()
+                            .animate(true),
+                    );
+                }
                 if ui.button("取消").clicked() {
                     self.progress.cancel.store(true, Ordering::Relaxed);
                 }
@@ -572,6 +742,23 @@ impl eframe::App for EncryptorApp {
             ui.colored_label(color, &self.status);
         });
     }
+}
+
+/// 拖曳檔案經過視窗時的提示遮罩。
+fn paint_drop_overlay(ctx: &egui::Context) {
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("drop_overlay"),
+    ));
+    let rect = ctx.screen_rect();
+    painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(190));
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "放開滑鼠以加入檔案",
+        egui::TextStyle::Heading.resolve(&ctx.style()),
+        egui::Color32::WHITE,
+    );
 }
 
 fn parent_dir(path: &Path) -> PathBuf {

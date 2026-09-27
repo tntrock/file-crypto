@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod batch;
 mod crypto;
 mod project;
 mod update;
@@ -17,6 +18,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([560.0, 460.0])
             .with_min_inner_size([460.0, 400.0])
+            .with_drag_and_drop(true)
             .with_icon(std::sync::Arc::new(icon)),
         ..Default::default()
     };
