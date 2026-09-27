@@ -56,6 +56,9 @@ pub const KEY_SOURCE_KEYFILE_HASH: u8 = 2;
 /// 標頭內的檔名不可用時，改用這個名稱。
 pub const FALLBACK_NAME: &str = "decrypted";
 
+/// 產生的金鑰檔長度（位元組）。
+pub const GENERATED_KEYFILE_LEN: usize = 64; // 512 位元
+
 /// 明文分塊大小（1 MiB）。密文塊會多出 16 位元組的驗證標籤。
 const PLAIN_CHUNK: usize = 1024 * 1024;
 const TAG_LEN: usize = 16;
@@ -601,6 +604,37 @@ pub fn decrypt_file(
             commit_unique(tmp, dir, &name)
         }
     }
+}
+
+/// 產生新的金鑰檔：以作業系統的安全亂數產生器填入 64 位元組，並設為唯讀。
+/// 絕不覆蓋既有檔案——覆蓋舊金鑰檔會讓以它加密的檔案全部無法解密。
+pub fn generate_keyfile(path: &Path) -> Result<()> {
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            bail!(
+                "檔案已存在：{}（為避免覆蓋既有金鑰檔，請換一個檔名）",
+                path.display()
+            )
+        }
+        Err(e) => bail!("無法建立金鑰檔 {}: {e}", path.display()),
+    };
+    let mut key = Zeroizing::new([0u8; GENERATED_KEYFILE_LEN]);
+    rand::rngs::OsRng.fill_bytes(key.as_mut());
+    let written = file.write_all(key.as_ref()).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(path);
+        bail!("寫入金鑰檔失敗: {e}");
+    }
+    let mut perm = std::fs::metadata(path)?.permissions();
+    perm.set_readonly(true);
+    std::fs::set_permissions(path, perm)?;
+    Ok(())
 }
 
 /// 以 BLAKE2b-512 串流雜湊金鑰檔，不論金鑰檔多大都只佔用固定記憶體。
@@ -1264,5 +1298,68 @@ mod tests {
         );
         assert!(res.unwrap_err().to_string().contains("取消"));
         assert!(!dir.path().join("a.enc").exists());
+    }
+
+    // ---- 產生金鑰檔 ----
+
+    #[test]
+    fn generated_keyfile_has_expected_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let kf = dir.path().join("new.key");
+        generate_keyfile(&kf).unwrap();
+        assert_eq!(fs::read(&kf).unwrap().len(), GENERATED_KEYFILE_LEN);
+    }
+
+    #[test]
+    fn generated_keyfiles_are_random() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.key");
+        let b = dir.path().join("b.key");
+        generate_keyfile(&a).unwrap();
+        generate_keyfile(&b).unwrap();
+        assert_ne!(fs::read(&a).unwrap(), fs::read(&b).unwrap());
+    }
+
+    #[test]
+    fn generating_never_overwrites_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = write(dir.path(), "old.key", b"my precious old key");
+        let err = generate_keyfile(&existing).unwrap_err();
+        assert!(err.to_string().contains("已存在"), "{err}");
+        assert_eq!(fs::read(&existing).unwrap(), b"my precious old key");
+    }
+
+    #[test]
+    fn generated_keyfile_is_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let kf = dir.path().join("new.key");
+        generate_keyfile(&kf).unwrap();
+        assert!(fs::metadata(&kf).unwrap().permissions().readonly());
+        // 讓 tempdir 能在測試結束時刪除
+        let mut perm = fs::metadata(&kf).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perm.set_readonly(false);
+        fs::set_permissions(&kf, perm).unwrap();
+    }
+
+    #[test]
+    fn generated_keyfile_can_encrypt_and_decrypt() {
+        let dir = tempfile::tempdir().unwrap();
+        let kf = dir.path().join("new.key");
+        generate_keyfile(&kf).unwrap();
+        let enc = encrypt_with_keyfile(dir.path(), &kf);
+        let out = decrypt_file(
+            &enc,
+            &Output::AutoName(dir.path().into()),
+            &Secret::Keyfile(&kf),
+            false,
+            &Progress::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read(out).unwrap(), b"keyfile protected");
+        let mut perm = fs::metadata(&kf).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perm.set_readonly(false);
+        fs::set_permissions(&kf, perm).unwrap();
     }
 }

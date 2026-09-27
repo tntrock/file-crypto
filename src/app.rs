@@ -458,6 +458,41 @@ impl EncryptorApp {
         });
     }
 
+    /// 產生新的隨機金鑰檔，並設為目前使用的金鑰檔。
+    fn generate_keyfile(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("選擇新金鑰檔的存放位置")
+            .set_file_name("file-crypto.key")
+            .add_filter("金鑰檔", &["key"])
+            .save_file()
+        else {
+            return;
+        };
+        match crypto::generate_keyfile(&path) {
+            Ok(()) => {
+                self.keyfile_path = Some(path.clone());
+                self.status = format!("已產生新的金鑰檔並選用：\n{}", path.display());
+                self.is_error = false;
+                rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Warning)
+                    .set_title("請立即備份金鑰檔")
+                    .set_description(format!(
+                        "已產生新的金鑰檔：\n{}\n\n\
+                         請立即把它複製到其他安全的地方（例如隨身碟）。\n\
+                         金鑰檔遺失或內容被修改，用它加密的檔案將永遠無法解密。\n\n\
+                         檔案已設為唯讀，以避免不小心被修改。",
+                        path.display()
+                    ))
+                    .set_buttons(rfd::MessageButtons::Ok)
+                    .show();
+            }
+            Err(e) => {
+                self.status = format!("{e:#}");
+                self.is_error = true;
+            }
+        }
+    }
+
     fn batch_dest_label(&self) -> String {
         match &self.batch_dest {
             Destination::SameAsInput => "各自所在的資料夾".to_owned(),
@@ -669,6 +704,10 @@ impl eframe::App for EncryptorApp {
                                     self.keyfile_path = Some(p);
                                 }
                             }
+                            if self.mode == Mode::Encrypt && ui.button("產生新金鑰檔…").clicked()
+                            {
+                                self.generate_keyfile();
+                            }
                             let txt = self
                                 .keyfile_path
                                 .as_ref()
@@ -678,7 +717,8 @@ impl eframe::App for EncryptorApp {
                         });
                         ui.label(
                             egui::RichText::new(
-                                "提示：任何檔案都可當金鑰檔，但務必妥善備份；遺失將無法解密。",
+                                "提示：任何檔案都可當金鑰檔，也可以按「產生新金鑰檔…」建立隨機金鑰檔；\
+                                 務必妥善備份，遺失將無法解密。",
                             )
                             .small()
                             .italics(),
