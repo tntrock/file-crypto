@@ -96,9 +96,10 @@ impl Progress {
     fn reset(&self, total: u64) {
         self.processed.store(0, Ordering::Relaxed);
         self.total.store(total.max(1), Ordering::Relaxed);
-        self.cancel.store(false, Ordering::Relaxed);
+        // 刻意不清除 cancel：批次處理時，取消可能發生在兩個檔案之間，
+        // 由開始整個工作的呼叫端負責清除。
     }
-    fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
 }
@@ -382,7 +383,7 @@ fn commit_unique(tmp: NamedTempFile, dir: &Path, name: &str) -> Result<PathBuf> 
     bail!("找不到可用的輸出檔名（{name} 已有太多同名檔案）")
 }
 
-/// 加密單一檔案。`overwrite` 為 false 時，輸出檔已存在就會失敗。
+/// 加密單一檔案到指定檔案。`overwrite` 為 false 時，輸出檔已存在就會失敗。
 pub fn encrypt_file(
     input: &Path,
     output: &Path,
@@ -390,6 +391,25 @@ pub fn encrypt_file(
     overwrite: bool,
     progress: &Progress,
 ) -> Result<()> {
+    encrypt_to(
+        input,
+        &Output::File(output.to_path_buf()),
+        secret,
+        overwrite,
+        progress,
+    )
+    .map(|_| ())
+}
+
+/// 加密單一檔案，回傳實際寫出的檔案路徑。
+/// `Output::AutoName(dir)` 會輸出為 `dir/原檔名.enc`，已存在時自動加編號，絕不覆蓋。
+pub fn encrypt_to(
+    input: &Path,
+    output: &Output,
+    secret: &Secret,
+    overwrite: bool,
+    progress: &Progress,
+) -> Result<PathBuf> {
     let name = input
         .file_name()
         .and_then(|s| s.to_str())
@@ -400,12 +420,12 @@ pub fn encrypt_file(
 /// 加密單一檔案，並把 `name` 當作原始檔名加密存入。
 fn encrypt_with_name(
     input: &Path,
-    output: &Path,
+    output: &Output,
     name: &str,
     secret: &Secret,
     overwrite: bool,
     progress: &Progress,
-) -> Result<()> {
+) -> Result<PathBuf> {
     let key_source = match secret {
         Secret::Password(_) => KEY_SOURCE_PASSWORD,
         Secret::Keyfile(_) => KEY_SOURCE_KEYFILE_HASH,
@@ -421,8 +441,14 @@ fn encrypt_with_name(
     let plain_size = std::fs::metadata(input)?.len() + meta.len() as u64;
     progress.reset(plain_size);
 
-    check_output_path(input, output, overwrite)?;
-    let mut tmp = temp_in(parent_dir(output))?;
+    let out_dir = match output {
+        Output::File(path) => {
+            check_output_path(input, path, overwrite)?;
+            parent_dir(path)
+        }
+        Output::AutoName(dir) => dir.as_path(),
+    };
+    let mut tmp = temp_in(out_dir)?;
 
     // 產生隨機 salt 與 nonce 前綴
     let mut salt = [0u8; SALT_LEN];
@@ -469,7 +495,17 @@ fn encrypt_with_name(
 
     writer.flush()?;
     drop(writer);
-    commit_output(tmp, output, overwrite)
+    match output {
+        Output::File(path) => {
+            commit_output(tmp, path, overwrite)?;
+            Ok(path.clone())
+        }
+        Output::AutoName(dir) => {
+            let mut enc_name = input.file_name().unwrap_or_default().to_os_string();
+            enc_name.push(".enc");
+            commit_unique(tmp, dir, &enc_name.to_string_lossy())
+        }
+    }
 }
 
 /// 讀取標頭資訊（不解密內容）。
@@ -953,7 +989,7 @@ mod tests {
         // 持有金鑰的人仍可能在加密內容裡塞入惡意檔名
         encrypt_with_name(
             &input,
-            &enc,
+            &Output::File(enc.clone()),
             r"..\..\evil.txt",
             &Secret::Password(PW),
             false,
@@ -1172,5 +1208,61 @@ mod tests {
         fs::write(&enc, bytes).unwrap();
         let err = peek_header(&enc).err().expect("應該失敗");
         assert!(err.to_string().contains("不支援的金鑰來源"), "{err}");
+    }
+
+    // ---- 批次處理需要的行為 ----
+
+    #[test]
+    fn encrypt_auto_name_uses_input_name_plus_enc() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write(dir.path(), "a.txt", b"data");
+        let out = encrypt_to(
+            &input,
+            &Output::AutoName(dir.path().into()),
+            &Secret::Password(PW),
+            false,
+            &Progress::default(),
+        )
+        .unwrap();
+        assert_eq!(out, dir.path().join("a.txt.enc"));
+        assert_eq!(
+            decrypt_to(&out, &dir.path().join("back.txt"), PW, false).unwrap(),
+            dir.path().join("back.txt")
+        );
+    }
+
+    #[test]
+    fn encrypt_auto_name_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write(dir.path(), "a.txt", b"data");
+        write(dir.path(), "a.txt.enc", b"existing");
+        let out = encrypt_to(
+            &input,
+            &Output::AutoName(dir.path().into()),
+            &Secret::Password(PW),
+            false,
+            &Progress::default(),
+        )
+        .unwrap();
+        assert_eq!(out, dir.path().join("a.txt (1).enc"));
+        assert_eq!(fs::read(dir.path().join("a.txt.enc")).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn cancel_requested_before_start_is_honored() {
+        // 批次處理時，使用者可能在兩個檔案之間按下取消；開始下一個檔案時不可把它清掉
+        let dir = tempfile::tempdir().unwrap();
+        let input = write(dir.path(), "a.txt", b"data");
+        let progress = Progress::default();
+        progress.cancel.store(true, Ordering::Relaxed);
+        let res = encrypt_file(
+            &input,
+            &dir.path().join("a.enc"),
+            &Secret::Password(PW),
+            false,
+            &progress,
+        );
+        assert!(res.unwrap_err().to_string().contains("取消"));
+        assert!(!dir.path().join("a.enc").exists());
     }
 }
