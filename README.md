@@ -1,7 +1,25 @@
 # 檔案加解密工具（Rust + egui）
 
-一個 Windows 桌面 GUI 工具，用來對**單一檔案**做加密與解密。  
+[![CI](https://github.com/tntrock/file-crypto/actions/workflows/ci.yml/badge.svg)](https://github.com/tntrock/file-crypto/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/tntrock/file-crypto)](https://github.com/tntrock/file-crypto/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+一個 Windows 桌面 GUI 工具，用來對**單一檔案**做加密與解密。
 介面純中文、免安裝、可攜。
+
+<p align="center"><img src="docs/screenshot.png" alt="程式畫面" width="480"></p>
+
+## 📥 下載
+
+到 [Releases](https://github.com/tntrock/file-crypto/releases/latest) 下載 `file-crypto-vX.Y.Z-windows-x64.exe`，雙擊即可執行，不需安裝。
+
+每個 exe 都由 GitHub Actions 從原始碼自動建置，並附上 `.sha256` 檔供驗證：
+
+```powershell
+Get-FileHash .\file-crypto-v1.1.0-windows-x64.exe -Algorithm SHA256
+```
+
+> 首次執行時 Windows SmartScreen 可能會警告「無法辨識的應用程式」，這是因為 exe 沒有程式碼簽章。點「其他資訊 → 仍要執行」即可。
 
 ## ✨ 功能特色
 
@@ -9,78 +27,144 @@
 - **金鑰衍生**：Argon2id（64 MiB / 3 iterations / 平行度 1），抗暴力破解
 - **串流分塊加密**：以 1 MiB 分塊處理，支援 GB 等級大檔，不吃爆記憶體
 - **兩種金鑰來源**：使用者密碼 **或** 金鑰檔（任何檔案皆可當金鑰）
-- **產生新檔**：不覆蓋原始檔案（加密輸出 `原名.enc`；解密自動還原原始檔名）
+- **檔名也加密**：原始檔名存在加密內容裡，`.enc` 檔可以任意改名，解密時自動還原
+- **絕不毀損既有檔案**：先寫入暫存檔，成功才改名成正式檔名；密碼錯誤、檔案損毀或取消時，不會動到任何既有檔案
 - **進度顯示 + 取消**：即時進度條，可中途取消
-- **記憶體安全**：密碼與金鑰使用後以 `zeroize` 清零
-- **單一 exe**：`--release` 編譯後為單一執行檔，複製即用
+- **單一 exe**：複製即用，可放在隨身碟
 
-## 🔒 安全設計說明
+## 🧪 使用步驟
 
-- AES-256-GCM 為業界標準的認證式加密（AEAD）；若密碼/金鑰錯誤或檔案被竄改，解密會直接失敗並提示，不會輸出錯誤明文。
-- 每次加密都會產生**隨機 salt 與隨機 nonce**，寫入檔案標頭；相同檔案相同密碼，每次密文都不同。
-- 使用 STREAM（BE32）建構，逐塊各自帶驗證標籤，可安全處理大檔並抵抗分塊重排/截斷攻擊。
+### 加密
+1. 選擇「🔒 加密」，點「選擇輸入檔…」。
+2. 輸出位置預設為 `原檔名.enc`，可按「輸出位置…」更改。
+3. 選金鑰來源：輸入兩次密碼，或選擇金鑰檔。
+4. 按「開始加密」。
 
-> ⚠️ **請務必牢記密碼或保管好金鑰檔。
-> ** 本工具無任何後門或救援機制，遺失即無法解密。
+### 解密
+1. 選擇「🔓 解密」，點「選擇輸入檔…」挑選 `.enc` 檔。程式會自動切換成加密時使用的金鑰來源。
+2. 輸出位置預設為**同一資料夾、使用原始檔名**；若已有同名檔案，會自動存成 `名稱 (1).副檔名`，不會覆蓋。
+   也可以按「輸出位置…」指定檔案；指定的檔案已存在時會先詢問是否覆蓋。
+3. 輸入密碼或選擇金鑰檔，按「開始解密」。
 
-## 🛠️ 建置方式
+## 🔒 安全設計
+
+- **認證式加密**：AES-256-GCM 為業界標準的 AEAD。密碼/金鑰錯誤或檔案遭竄改時，解密會直接失敗，不會輸出錯誤的明文。
+- **標頭受保護**：整段標頭（版本、金鑰來源、Argon2 參數、salt、nonce）作為每個分塊的附加驗證資料（AAD），竄改任何一個位元組都會解密失敗。
+- **隨機 salt 與 nonce**：每次加密都重新產生；相同檔案、相同密碼，每次的密文都不同。
+- **STREAM 分塊**：採用 STREAM（BE32）建構，每個分塊各自帶驗證標籤，可偵測分塊被重排、刪除或截斷。
+- **不信任輸入檔**：解密前會檢查標頭參數的上限（避免惡意檔案耗盡記憶體），並把還原的檔名淨化為單純檔名（避免 `..\` 或絕對路徑把檔案寫到其他位置）。
+- **敏感資料清除**：衍生出的金鑰與明文緩衝區使用後以 `zeroize` 清零。
+
+> ⚠️ **請務必牢記密碼，並備份好金鑰檔。** 本工具沒有任何後門或救援機制，遺失即無法解密。
+
+## ⚠️ 已知限制
+
+- **本工具未經專業安全稽核。** 設計上使用成熟的密碼學套件（RustCrypto），但請自行評估是否適合你的用途。
+- **金鑰檔必須逐位元組相同。** 任何檔案都能當金鑰檔，但只要內容有一點改變（例如圖片被重新存檔、被修改中繼資料），就再也無法解密。建議使用不會變動的檔案，並另外備份。
+- **金鑰檔會整個讀進記憶體**，請不要選擇過大的檔案（例如數 GB 的影片）。
+- **不能同時使用密碼和金鑰檔。**
+- **`.enc` 檔名本身不加密。** 預設輸出名稱是 `原檔名.enc`；若不想透露檔名，請自行把 `.enc` 檔改名（解密時仍會還原原始檔名）。
+- **輸入框中的密碼**由 GUI 框架管理，無法保證在記憶體中被完全清除。
+- **只支援 Windows**（介面字型取自 Windows 系統字型）。
+
+## 📄 加密檔格式
+
+目前版本為 **v2**（v1.1.0 起）。所有整數為小端序。
+
+| 位移 | 長度 | 欄位 |
+|---:|---:|---|
+| 0 | 6 | Magic = `RFENC1` |
+| 6 | 1 | 格式版本（2） |
+| 7 | 1 | 演算法（1 = AES-256-GCM / STREAM BE32） |
+| 8 | 1 | 金鑰來源（0 = 密碼、1 = 金鑰檔） |
+| 9 | 4 | Argon2 m_cost（KiB） |
+| 13 | 4 | Argon2 t_cost（迭代次數） |
+| 17 | 4 | Argon2 p_cost（平行度） |
+| 21 | 1 | Salt 長度（16） |
+| 22 | 16 | Salt |
+| 38 | 7 | STREAM nonce 前綴 |
+| 45 | … | 加密分塊（每塊 = 明文 1 MiB + 16 位元組驗證標籤，最後一塊可較短） |
+
+- 位移 0–44 的標頭作為每個分塊的 AAD。
+- 加密前的明文串流為：`原始檔名長度 (u16)` + `原始檔名 (UTF-8)` + `檔案內容`。
+- 金鑰 = Argon2id(密碼或金鑰檔內容, salt)，長度 32 位元組。
+
+### 版本相容性
+
+| 格式 | 產生版本 | 新版可否解密 | 差異 |
+|---|---|---|---|
+| v2 | v1.1.0 起 | ✅ | 標頭受驗證、檔名加密 |
+| v1 | v1.0.0 – v1.0.1 | ✅ | 標頭未受驗證，原始檔名以明文存在標頭 |
+
+新版一律產生 v2 檔案；舊版程式無法解密 v2 檔案。解密 v1 檔案時程式會提示，建議解密後重新加密。
+
+## 🛠️ 從原始碼建置
 
 ### 前置需求
 - 安裝 [Rust 工具鏈](https://rustup.rs/)（含 `cargo`）。
+- MSVC 工具鏈需要 Windows SDK 的 `rc.exe` 來嵌入 exe 圖示（安裝 Visual Studio Build Tools 即內含）；GNU 工具鏈則需要 MinGW-w64。
 
-### 1. 在 Windows 上直接編譯（最簡單）
+### 在 Windows 上編譯
 ```powershell
+git clone https://github.com/tntrock/file-crypto.git
 cd file-crypto
 cargo build --release
 ```
-產物：`target\release\file-crypto.exe`（雙擊即可執行，可自由複製到隨身碟）。
+產物：`target\release\file-crypto.exe`
 
-### 2. 從 Linux / macOS 交叉編譯成 Windows exe
+### 從 Linux / macOS 交叉編譯
 ```bash
 rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 產物：`target/x86_64-pc-windows-gnu/release/file-crypto.exe`
-
 （需安裝 MinGW-w64；Debian/Ubuntu：`sudo apt install mingw-w64`）
 
-## 🧪 使用步驟
+### 執行測試
+```powershell
+cargo test
+```
+測試涵蓋加解密往返、分塊邊界、竄改與截斷偵測、失敗時不毀損既有檔案、惡意標頭，以及 v1 舊檔相容性。
 
-1. 選擇「🔒 加密」或「🔓 解密」。
-2. 點「選擇輸入檔…」挑選要處理的檔案。
-3. 確認「輸出位置」（已自動填好建議路徑，可自行更改）。
-4. 選金鑰來源：輸入密碼（加密需再確認一次）或選擇金鑰檔。
-5. 按「開始加密／解密」，等待進度條完成。
+## 🚀 發佈新版本
 
-## 📄 加密檔格式
-
-自訂容器，標頭（明文）記錄版本、演算法、Argon2 參數、salt、nonce 前綴與原始檔名，
-之後接續 AES-256-GCM STREAM 的密文分塊。詳見 `src/crypto.rs` 檔頭註解。
+1. 修改 `Cargo.toml` 的 `version`（例如 `1.1.1`）並合併到 `main`。
+2. 推送同名 tag：
+   ```bash
+   git tag -a v1.1.1 -m "v1.1.1"
+   git push origin v1.1.1
+   ```
+3. GitHub Actions 會自動跑測試、編譯 exe、計算 SHA-256，並上傳到同名的 Release。若 tag 與 `Cargo.toml` 版本不一致，建置會失敗。
 
 ## 🎨 更換應用程式圖示
 
-圖示分兩個層次，都已設定好：
+- **EXE 檔案圖示**（檔案總管）：`build.rs` 透過 `winresource` 把 `assets/icon.ico` 嵌入 exe。
+- **視窗圖示**（標題列／工作列）：`main.rs` 讀取 `assets/icon.png`。
 
-- **EXE 檔案圖示**（檔案總管縮圖）：由 `build.rs` 透過 `winresource` 把 `assets/icon.ico` 嵌入 exe。
-- **視窗圖示**（標題列／工作列）：`main.rs` 用 `eframe::icon_data::from_png_bytes` 讀取 `assets/icon.png`。
-
-想換成自己的圖示，只要替換這兩個檔案即可：
-- `assets/icon.ico`（多尺寸，建議含 256/48/32/16）
-- `assets/icon.png`（建議 256×256）
-
-> 在 Windows 上以 MSVC 工具鏈編譯，`winresource` 需要 Windows SDK 的 `rc.exe`（安裝 Visual Studio Build Tools 即內含）；GNU 工具鏈則需 MinGW-w64。
+替換這兩個檔案即可：`icon.ico` 建議包含 256/48/32/16 多種尺寸，`icon.png` 建議 256×256。
 
 ## 📁 專案結構
 ```
 file-crypto/
-├─ Cargo.toml
-├─ build.rs          # 建置腳本：嵌入 exe 圖示與版本資訊
-├─ README.md
+├─ .github/workflows/
+│  ├─ ci.yml         # push／PR 時執行格式檢查、clippy、測試
+│  └─ release.yml    # 推送 v* tag 時建置 exe 並發佈
 ├─ assets/
 │  ├─ icon.ico       # exe 檔案圖示（多尺寸）
 │  └─ icon.png       # 視窗／工作列圖示（256×256）
-└─ src/
-   ├─ main.rs        # 進入點、視窗設定、載入視窗圖示
-   ├─ app.rs         # egui GUI 介面與背景工作執行緒
-   └─ crypto.rs      # AES-256-GCM + Argon2id 核心與檔案格式
+├─ docs/
+│  └─ screenshot.png
+├─ src/
+│  ├─ main.rs        # 進入點、視窗設定、載入視窗圖示
+│  ├─ app.rs         # egui GUI 介面與背景工作執行緒
+│  └─ crypto.rs      # AES-256-GCM + Argon2id 核心、檔案格式與單元測試
+├─ tests/fixtures/
+│  └─ v1_sample.enc  # v1 格式範例檔，用於相容性測試
+├─ build.rs          # 建置腳本：嵌入 exe 圖示與版本資訊
+├─ Cargo.toml
+└─ Cargo.lock
 ```
+
+## 📜 授權
+
+[MIT License](LICENSE)

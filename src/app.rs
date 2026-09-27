@@ -8,7 +8,7 @@ use std::thread;
 use eframe::egui;
 use zeroize::Zeroize;
 
-use crate::crypto::{self, Progress, KEY_SOURCE_KEYFILE, KEY_SOURCE_PASSWORD};
+use crate::crypto::{self, Output, Progress, KEY_SOURCE_KEYFILE, KEY_SOURCE_PASSWORD};
 
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {
@@ -30,7 +30,9 @@ pub struct EncryptorApp {
     key_mode: KeyMode,
 
     input_path: Option<PathBuf>,
-    output_path: Option<PathBuf>,
+    output: Option<Output>,
+    /// 解密前就能得知的原始檔名（只有 v1 檔案才有），僅供顯示。
+    known_name: Option<String>,
     keyfile_path: Option<PathBuf>,
 
     password: String,
@@ -53,7 +55,8 @@ impl EncryptorApp {
             mode: Mode::Encrypt,
             key_mode: KeyMode::Password,
             input_path: None,
-            output_path: None,
+            output: None,
+            known_name: None,
             keyfile_path: None,
             password: String::new(),
             password_confirm: String::new(),
@@ -66,39 +69,46 @@ impl EncryptorApp {
         }
     }
 
-    /// 依模式與輸入檔，推算預設輸出路徑。
+    /// 依模式與輸入檔，推算預設輸出位置。
     fn suggest_output(&mut self) {
         let Some(input) = self.input_path.clone() else {
             return;
         };
+        self.known_name = None;
         match self.mode {
             Mode::Encrypt => {
                 let mut s = input.into_os_string();
                 s.push(".enc");
-                self.output_path = Some(PathBuf::from(s));
+                self.output = Some(Output::File(PathBuf::from(s)));
             }
             Mode::Decrypt => {
-                // 優先使用加密檔內記錄的原始檔名
+                // 預設輸出到同一資料夾，檔名使用加密檔內記錄的原始檔名
+                self.output = Some(Output::AutoName(parent_dir(&input)));
                 if let Ok(info) = crypto::peek_header(&input) {
-                    let dir = input.parent().map(PathBuf::from).unwrap_or_default();
-                    let mut candidate = dir.join(&info.original_name);
-                    if candidate == input {
-                        // 避免覆蓋來源，加上 .dec
-                        let mut s = candidate.into_os_string();
-                        s.push(".dec");
-                        candidate = PathBuf::from(s);
+                    if info.version == 1 {
+                        self.status = "提示：這是舊版（v1）加密檔，標頭未受保護且檔名未加密；\
+                                       建議解密後用新版重新加密。"
+                            .to_owned();
+                        self.is_error = false;
                     }
-                    self.output_path = Some(candidate);
-                    if info.key_source == KEY_SOURCE_KEYFILE {
-                        self.key_mode = KeyMode::Keyfile;
-                    }
-                } else if input.extension().and_then(|e| e.to_str()) == Some("enc") {
-                    self.output_path = Some(input.with_extension(""));
-                } else {
-                    let mut s = input.into_os_string();
-                    s.push(".dec");
-                    self.output_path = Some(PathBuf::from(s));
+                    self.known_name = info.original_name;
+                    self.key_mode = if info.key_source == KEY_SOURCE_KEYFILE {
+                        KeyMode::Keyfile
+                    } else {
+                        KeyMode::Password
+                    };
                 }
+            }
+        }
+    }
+
+    fn output_label(&self) -> String {
+        match &self.output {
+            None => "（未指定）".into(),
+            Some(Output::File(p)) => p.display().to_string(),
+            Some(Output::AutoName(dir)) => {
+                let name = self.known_name.as_deref().unwrap_or("原始檔名，解密後還原");
+                format!("{}（{name}；同名時自動加編號）", dir.join("").display())
             }
         }
     }
@@ -107,11 +117,14 @@ impl EncryptorApp {
         let Some(input) = &self.input_path else {
             return Err("尚未選擇輸入檔。".into());
         };
-        let Some(output) = &self.output_path else {
-            return Err("尚未指定輸出檔。".into());
-        };
-        if input == output {
-            return Err("輸出檔不可與輸入檔相同。".into());
+        match (&self.output, self.mode) {
+            (None, _) | (Some(Output::AutoName(_)), Mode::Encrypt) => {
+                return Err("尚未指定輸出檔。".into());
+            }
+            (Some(Output::File(output)), _) if output == input => {
+                return Err("輸出檔不可與輸入檔相同。".into());
+            }
+            _ => {}
         }
         match self.key_mode {
             KeyMode::Password => {
@@ -143,11 +156,12 @@ impl EncryptorApp {
         };
 
         let input = self.input_path.clone().unwrap();
-        let output = self.output_path.clone().unwrap();
+        let output = self.output.clone().unwrap();
 
-        // 輸出檔已存在時先詢問；只有成功完成才會真的取代它
-        let overwrite = output.exists();
-        if overwrite && !confirm_overwrite(&output) {
+        // 指定的輸出檔已存在時先詢問；只有成功完成才會真的取代它。
+        // 自動命名模式永遠不覆蓋，不需詢問。
+        let overwrite = matches!(&output, Output::File(p) if p.exists());
+        if overwrite && !confirm_overwrite(output.path()) {
             material.zeroize();
             self.status = "已取消：輸出檔已存在。".to_owned();
             self.is_error = true;
@@ -172,8 +186,14 @@ impl EncryptorApp {
         thread::spawn(move || {
             let outcome = match mode {
                 Mode::Encrypt => crypto::encrypt_file(
-                    &input, &output, &material, key_source, overwrite, &progress,
-                ),
+                    &input,
+                    output.path(),
+                    &material,
+                    key_source,
+                    overwrite,
+                    &progress,
+                )
+                .map(|()| output.path().to_path_buf()),
                 Mode::Decrypt => {
                     crypto::decrypt_file(&input, &output, &material, overwrite, &progress)
                 }
@@ -181,7 +201,7 @@ impl EncryptorApp {
             material.zeroize();
 
             let msg = match outcome {
-                Ok(()) => Ok(format!("完成！已輸出至：\n{}", output.display())),
+                Ok(written) => Ok(format!("完成！已輸出至：\n{}", written.display())),
                 // 半成品只存在於暫存檔，crypto 模組失敗時會自行清除
                 Err(e) => Err(format!("失敗：{e}")),
             };
@@ -256,24 +276,32 @@ impl eframe::App for EncryptorApp {
                 ui.horizontal(|ui| {
                     if ui.button("輸出位置…").clicked() {
                         let mut dlg = rfd::FileDialog::new();
-                        if let Some(p) = &self.output_path {
-                            if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
-                                dlg = dlg.set_file_name(name);
+                        match &self.output {
+                            Some(Output::File(p)) => {
+                                if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                                    dlg = dlg.set_file_name(name);
+                                }
+                                dlg = dlg.set_directory(parent_dir(p));
                             }
-                            if let Some(dir) = p.parent() {
+                            Some(Output::AutoName(dir)) => {
+                                if let Some(name) = &self.known_name {
+                                    dlg = dlg.set_file_name(name);
+                                }
                                 dlg = dlg.set_directory(dir);
                             }
+                            None => {}
                         }
                         if let Some(p) = dlg.save_file() {
-                            self.output_path = Some(p);
+                            self.output = Some(Output::File(p));
                         }
                     }
-                    let txt = self
-                        .output_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "（未指定）".into());
-                    ui.label(txt);
+                    if self.mode == Mode::Decrypt
+                        && matches!(self.output, Some(Output::File(_)))
+                        && ui.button("使用原始檔名").clicked()
+                    {
+                        self.suggest_output();
+                    }
+                    ui.label(self.output_label());
                 });
 
                 ui.separator();
@@ -365,6 +393,10 @@ impl eframe::App for EncryptorApp {
             ui.colored_label(color, &self.status);
         });
     }
+}
+
+fn parent_dir(path: &Path) -> PathBuf {
+    path.parent().map(PathBuf::from).unwrap_or_default()
 }
 
 fn confirm_overwrite(output: &Path) -> bool {

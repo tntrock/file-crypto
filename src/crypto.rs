@@ -1,11 +1,11 @@
 //! 核心密碼學模組
 //!
-//! 檔案格式（自訂容器，小端序）：
+//! 檔案格式 v2（自訂容器，小端序）：
 //! ┌────────────┬──────┬───────────────────────────────────────────────┐
 //! │ 位移       │ 長度 │ 欄位                                           │
 //! ├────────────┼──────┼───────────────────────────────────────────────┤
 //! │ 0          │ 6    │ Magic  = b"RFENC1"                             │
-//! │ 6          │ 1    │ 版本   (VERSION = 1)                           │
+//! │ 6          │ 1    │ 版本   (VERSION = 2)                           │
 //! │ 7          │ 1    │ 演算法 (1 = AES-256-GCM / STREAM BE32)         │
 //! │ 8          │ 1    │ 金鑰來源 (0 = 密碼, 1 = 金鑰檔)                │
 //! │ 9          │ 4    │ Argon2 m_cost (KiB)                            │
@@ -14,19 +14,25 @@
 //! │ 21         │ 1    │ Salt 長度 (= 16)                               │
 //! │ 22         │ 16   │ Salt                                           │
 //! │ 38         │ 7    │ STREAM nonce 前綴 (12 - 5)                     │
-//! │ 45         │ 2    │ 原始檔名長度 (u16)                             │
-//! │ 47         │ N    │ 原始檔名 (UTF-8)                               │
-//! │ 47+N       │ ...  │ 加密後分塊（每塊 = 明文塊 + 16 位元組驗證標籤）│
+//! │ 45         │ ...  │ 加密後分塊（每塊 = 明文塊 + 16 位元組驗證標籤）│
 //! └────────────┴──────┴───────────────────────────────────────────────┘
+//!
+//! - 整段標頭（位移 0–44）作為每個分塊的 AAD，竄改任一位元組都會解密失敗。
+//! - 加密前的明文串流 = 原始檔名長度 (u16) + 原始檔名 (UTF-8) + 檔案內容，
+//!   因此原始檔名也經過加密，解密前無法得知。
+//!
+//! 舊版 v1 仍可解密：v1 在 nonce 前綴之後以明文存放「檔名長度 (u16) + 檔名」，
+//! 分塊不帶 AAD，明文串流只有檔案內容。
 
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
 use std::ops::RangeInclusive;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::stream::{DecryptorBE32, EncryptorBE32};
+use aes_gcm::aead::Payload;
 use aes_gcm::{Aes256Gcm, KeyInit};
 use anyhow::{anyhow, bail, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -35,7 +41,8 @@ use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
 
 const MAGIC: &[u8; 6] = b"RFENC1";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
+const VERSION_V1: u8 = 1;
 const ALG_AES256GCM: u8 = 1;
 
 pub const KEY_SOURCE_PASSWORD: u8 = 0;
@@ -61,6 +68,9 @@ const ALLOWED_M_COST: RangeInclusive<u32> = 8..=1024 * 1024; // 最多 1 GiB
 const ALLOWED_T_COST: RangeInclusive<u32> = 1..=16;
 const ALLOWED_P_COST: RangeInclusive<u32> = 1..=16;
 const ALLOWED_SALT_LEN: RangeInclusive<usize> = 16..=64;
+
+/// 自動命名時，同名檔案已存在最多嘗試加到幾號。
+const MAX_NAME_SUFFIX: u32 = 999;
 
 const DECRYPT_FAILED: &str = "解密失敗：密碼/金鑰檔錯誤，或檔案已損毀/被竄改";
 
@@ -90,22 +100,68 @@ impl Progress {
 
 /// 解密前先讀取標頭，供 GUI 顯示原始檔名等資訊。
 pub struct HeaderInfo {
+    pub version: u8,
     /// 已淨化、只剩單純檔名的原始檔名，可安全地 join 到輸出目錄。
-    pub original_name: String,
+    /// v2 起檔名經過加密，解密前無法得知，此時為 None。
+    pub original_name: Option<String>,
     pub key_source: u8,
+}
+
+/// 解密輸出位置。
+#[derive(Clone)]
+pub enum Output {
+    /// 寫到指定檔案。
+    File(PathBuf),
+    /// 寫到指定資料夾，檔名使用加密檔內記錄的原始檔名；同名檔案已存在時自動加編號，絕不覆蓋。
+    AutoName(PathBuf),
+}
+
+impl Output {
+    /// 指定的檔案，或自動命名時的目標資料夾。
+    pub fn path(&self) -> &Path {
+        match self {
+            Output::File(p) | Output::AutoName(p) => p,
+        }
+    }
 }
 
 /// 解析後的完整標頭。
 struct Header {
+    version: u8,
     key_source: u8,
     m_cost: u32,
     t_cost: u32,
     p_cost: u32,
     salt: Vec<u8>,
     nonce_prefix: [u8; 7],
-    original_name: String,
-    /// 標頭總長度（位元組），密文從這裡開始。
-    len: u64,
+    /// 只有 v1 才有：以明文存放在標頭裡的原始檔名。
+    v1_name: Option<String>,
+    /// 標頭的原始位元組；密文從這之後開始，v2 也以它作為 AAD。
+    raw: Vec<u8>,
+}
+
+impl Header {
+    fn aad(&self) -> &[u8] {
+        if self.version == VERSION_V1 {
+            &[]
+        } else {
+            &self.raw
+        }
+    }
+}
+
+/// 組出 v2 標頭。
+fn build_header(key_source: u8, salt: &[u8], nonce_prefix: &[u8; 7]) -> Vec<u8> {
+    let mut h = Vec::with_capacity(45);
+    h.extend_from_slice(MAGIC);
+    h.extend_from_slice(&[VERSION, ALG_AES256GCM, key_source]);
+    h.extend_from_slice(&ARGON_M_COST.to_le_bytes());
+    h.extend_from_slice(&ARGON_T_COST.to_le_bytes());
+    h.extend_from_slice(&ARGON_P_COST.to_le_bytes());
+    h.push(salt.len() as u8);
+    h.extend_from_slice(salt);
+    h.extend_from_slice(nonce_prefix);
+    h
 }
 
 /// 以 Argon2id 從密碼/金鑰檔內容衍生出 32 位元組金鑰。
@@ -139,23 +195,41 @@ fn read_array<const N: usize, R: Read>(r: &mut R) -> io::Result<[u8; N]> {
     Ok(buf)
 }
 
+/// 讀取時順便記下讀到的位元組，用來取得標頭原文。
+struct Recorder<'a, R> {
+    inner: &'a mut R,
+    bytes: Vec<u8>,
+}
+
+impl<R: Read> Read for Recorder<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.bytes.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+}
+
 /// 讀取並驗證標頭。所有欄位都來自不可信的檔案，數值參數必須先檢查範圍。
-fn read_header<R: Read>(r: &mut R) -> Result<Header> {
-    let magic: [u8; 6] = read_array(r)?;
+fn read_header<R: Read>(inner: &mut R) -> Result<Header> {
+    let mut r = Recorder {
+        inner,
+        bytes: Vec::new(),
+    };
+    let magic: [u8; 6] = read_array(&mut r)?;
     if &magic != MAGIC {
         bail!("這不是本工具產生的加密檔（Magic 不符）");
     }
-    let [version, alg, key_source] = read_array(r)?;
-    if version != VERSION {
-        bail!("不支援的檔案版本: {version}");
+    let [version, alg, key_source] = read_array(&mut r)?;
+    if version != VERSION && version != VERSION_V1 {
+        bail!("不支援的檔案版本: {version}（請更新本工具）");
     }
     if alg != ALG_AES256GCM {
         bail!("不支援的演算法代碼: {alg}");
     }
-    let m_cost = u32::from_le_bytes(read_array(r)?);
-    let t_cost = u32::from_le_bytes(read_array(r)?);
-    let p_cost = u32::from_le_bytes(read_array(r)?);
-    let [salt_len] = read_array(r)?;
+    let m_cost = u32::from_le_bytes(read_array(&mut r)?);
+    let t_cost = u32::from_le_bytes(read_array(&mut r)?);
+    let p_cost = u32::from_le_bytes(read_array(&mut r)?);
+    let [salt_len] = read_array(&mut r)?;
     let salt_len = salt_len as usize;
     if !ALLOWED_M_COST.contains(&m_cost)
         || !ALLOWED_T_COST.contains(&t_cost)
@@ -166,25 +240,41 @@ fn read_header<R: Read>(r: &mut R) -> Result<Header> {
     }
     let mut salt = vec![0u8; salt_len];
     r.read_exact(&mut salt)?;
-    let nonce_prefix = read_array(r)?;
-    let fname_len = u16::from_le_bytes(read_array(r)?) as usize;
-    let mut fname = vec![0u8; fname_len];
-    r.read_exact(&mut fname)?;
+    let nonce_prefix = read_array(&mut r)?;
+
+    let v1_name = if version == VERSION_V1 {
+        let fname_len = u16::from_le_bytes(read_array(&mut r)?) as usize;
+        let mut fname = vec![0u8; fname_len];
+        r.read_exact(&mut fname)?;
+        Some(String::from_utf8_lossy(&fname).into_owned())
+    } else {
+        None
+    };
 
     Ok(Header {
+        version,
         key_source,
         m_cost,
         t_cost,
         p_cost,
         salt,
         nonce_prefix,
-        original_name: String::from_utf8_lossy(&fname).into_owned(),
-        len: (6 + 3 + 12 + 1 + salt_len + 7 + 2 + fname_len) as u64,
+        v1_name,
+        raw: r.bytes,
     })
 }
 
-/// 把標頭裡的原始檔名淨化成「單純的檔名」。
-/// 標頭沒有經過驗證，攻擊者可以塞入 `..\..\x` 或 `C:\...` 讓輸出寫到任意位置，
+/// 從 v2 第一個明文分塊的開頭取出原始檔名，回傳（檔名, 其餘的檔案內容）。
+fn split_name(plain: &[u8]) -> Result<(String, &[u8])> {
+    let malformed = || anyhow!("加密內容格式錯誤");
+    let len_bytes = plain.get(..2).ok_or_else(malformed)?;
+    let end = 2 + u16::from_le_bytes([len_bytes[0], len_bytes[1]]) as usize;
+    let name = plain.get(2..end).ok_or_else(malformed)?;
+    Ok((String::from_utf8_lossy(name).into_owned(), &plain[end..]))
+}
+
+/// 把原始檔名淨化成「單純的檔名」。
+/// 檔名來自不可信的檔案，攻擊者可以塞入 `..\..\x` 或 `C:\...` 讓輸出寫到任意位置，
 /// 所以只保留最後一段，並拒絕 Windows 上不合法或有特殊意義的名稱。
 fn sanitize_file_name(raw: &str) -> String {
     let last = raw.rsplit(['/', '\\']).next().unwrap_or("");
@@ -210,10 +300,8 @@ fn sanitize_file_name(raw: &str) -> String {
     }
 }
 
-/// 檢查輸出路徑，並在同一目錄建立暫存檔。
-/// 內容全部寫進暫存檔，成功後才改名成正式檔名（見 `commit_output`）；
-/// 任何錯誤或取消時暫存檔會在 drop 時自動刪除，既有的輸出檔完全不會被動到。
-fn create_temp_output(input: &Path, output: &Path, overwrite: bool) -> Result<NamedTempFile> {
+/// 檢查指定的輸出檔：不可是輸入檔本身；已存在時必須允許覆蓋。
+fn check_output_path(input: &Path, output: &Path, overwrite: bool) -> Result<()> {
     if output.exists() {
         if std::fs::canonicalize(input)? == std::fs::canonicalize(output)? {
             bail!("輸出檔不可與輸入檔相同");
@@ -222,10 +310,20 @@ fn create_temp_output(input: &Path, output: &Path, overwrite: bool) -> Result<Na
             bail!("輸出檔已存在：{}", output.display());
         }
     }
-    let dir = match output.parent() {
+    Ok(())
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
         Some(d) if !d.as_os_str().is_empty() => d,
         _ => Path::new("."),
-    };
+    }
+}
+
+/// 在輸出目錄建立暫存檔。
+/// 內容全部寫進暫存檔，成功後才改名成正式檔名；
+/// 任何錯誤或取消時暫存檔會在 drop 時自動刪除，既有的輸出檔完全不會被動到。
+fn temp_in(dir: &Path) -> Result<NamedTempFile> {
     Ok(tempfile::Builder::new()
         .prefix(".file-crypto-")
         .suffix(".partial")
@@ -244,6 +342,29 @@ fn commit_output(tmp: NamedTempFile, output: &Path, overwrite: bool) -> Result<(
     Ok(())
 }
 
+/// 把完成的暫存檔改名為 `dir/name`；已存在時依序嘗試「名稱 (1).副檔名」…，絕不覆蓋。
+fn commit_unique(tmp: NamedTempFile, dir: &Path, name: &str) -> Result<PathBuf> {
+    tmp.as_file().sync_all()?;
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => name.split_at(i),
+        _ => (name, ""),
+    };
+    let mut tmp = tmp;
+    for n in 0..=MAX_NAME_SUFFIX {
+        let candidate = if n == 0 {
+            dir.join(name)
+        } else {
+            dir.join(format!("{stem} ({n}){ext}"))
+        };
+        match tmp.persist_noclobber(&candidate) {
+            Ok(_) => return Ok(candidate),
+            Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => tmp = e.file,
+            Err(e) => bail!("無法寫入輸出檔 {}: {}", candidate.display(), e.error),
+        }
+    }
+    bail!("找不到可用的輸出檔名（{name} 已有太多同名檔案）")
+}
+
 /// 加密單一檔案。`overwrite` 為 false 時，輸出檔已存在就會失敗。
 pub fn encrypt_file(
     input: &Path,
@@ -253,19 +374,37 @@ pub fn encrypt_file(
     overwrite: bool,
     progress: &Progress,
 ) -> Result<()> {
-    let plain_size = std::fs::metadata(input)?.len();
-    progress.reset(plain_size);
-
-    let fname = input
+    let name = input
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("output")
-        .as_bytes();
-    if fname.len() > u16::MAX as usize {
+        .unwrap_or("output");
+    encrypt_with_name(
+        input, output, name, material, key_source, overwrite, progress,
+    )
+}
+
+/// 加密單一檔案，並把 `name` 當作原始檔名加密存入。
+fn encrypt_with_name(
+    input: &Path,
+    output: &Path,
+    name: &str,
+    material: &[u8],
+    key_source: u8,
+    overwrite: bool,
+    progress: &Progress,
+) -> Result<()> {
+    if name.len() > u16::MAX as usize {
         bail!("檔名過長");
     }
+    // 明文串流 = 檔名長度 + 檔名 + 檔案內容
+    let mut meta = Vec::with_capacity(2 + name.len());
+    meta.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    meta.extend_from_slice(name.as_bytes());
+    let plain_size = std::fs::metadata(input)?.len() + meta.len() as u64;
+    progress.reset(plain_size);
 
-    let mut tmp = create_temp_output(input, output, overwrite)?;
+    check_output_path(input, output, overwrite)?;
+    let mut tmp = temp_in(parent_dir(output))?;
 
     // 產生隨機 salt 與 nonce 前綴
     let mut salt = [0u8; SALT_LEN];
@@ -275,26 +414,17 @@ pub fn encrypt_file(
     rng.fill_bytes(&mut nonce_prefix);
 
     let key = derive_key(material, &salt, ARGON_M_COST, ARGON_T_COST, ARGON_P_COST)?;
+    let header = build_header(key_source, &salt, &nonce_prefix);
 
     let mut writer = BufWriter::new(tmp.as_file_mut());
-    // 寫入標頭
-    writer.write_all(MAGIC)?;
-    writer.write_all(&[VERSION, ALG_AES256GCM, key_source])?;
-    writer.write_all(&ARGON_M_COST.to_le_bytes())?;
-    writer.write_all(&ARGON_T_COST.to_le_bytes())?;
-    writer.write_all(&ARGON_P_COST.to_le_bytes())?;
-    writer.write_all(&[salt.len() as u8])?;
-    writer.write_all(&salt)?;
-    writer.write_all(&nonce_prefix)?;
-    writer.write_all(&(fname.len() as u16).to_le_bytes())?;
-    writer.write_all(fname)?;
+    writer.write_all(&header)?;
 
     // 建立 STREAM 加密器
     let cipher = Aes256Gcm::new_from_slice(key.as_ref()).map_err(|_| anyhow!("金鑰長度錯誤"))?;
     let nonce = GenericArray::from_slice(&nonce_prefix);
     let mut enc = Some(EncryptorBE32::from_aead(cipher, nonce));
 
-    let mut reader = BufReader::new(File::open(input)?);
+    let mut reader = Cursor::new(meta).chain(BufReader::new(File::open(input)?));
     let n_chunks = plain_size.div_ceil(PLAIN_CHUNK as u64).max(1);
     let mut buf = Zeroizing::new(vec![0u8; PLAIN_CHUNK]);
     let mut processed: u64 = 0;
@@ -304,18 +434,16 @@ pub fn encrypt_file(
             bail!("使用者已取消");
         }
         let read_n = read_up_to(&mut reader, &mut buf)?;
-        let chunk = &buf[..read_n];
-        let ciphertext = if i + 1 == n_chunks {
-            enc.take()
-                .unwrap()
-                .encrypt_last(chunk)
-                .map_err(|_| anyhow!("加密失敗"))?
-        } else {
-            enc.as_mut()
-                .unwrap()
-                .encrypt_next(chunk)
-                .map_err(|_| anyhow!("加密失敗"))?
+        let payload = Payload {
+            msg: &buf[..read_n],
+            aad: &header,
         };
+        let ciphertext = if i + 1 == n_chunks {
+            enc.take().unwrap().encrypt_last(payload)
+        } else {
+            enc.as_mut().unwrap().encrypt_next(payload)
+        }
+        .map_err(|_| anyhow!("加密失敗"))?;
         writer.write_all(&ciphertext)?;
         processed += read_n as u64;
         progress.processed.store(processed, Ordering::Relaxed);
@@ -330,27 +458,36 @@ pub fn encrypt_file(
 pub fn peek_header(input: &Path) -> Result<HeaderInfo> {
     let header = read_header(&mut BufReader::new(File::open(input)?))?;
     Ok(HeaderInfo {
-        original_name: sanitize_file_name(&header.original_name),
+        version: header.version,
+        original_name: header.v1_name.as_deref().map(sanitize_file_name),
         key_source: header.key_source,
     })
 }
 
-/// 解密單一檔案。`overwrite` 為 false 時，輸出檔已存在就會失敗。
+/// 解密單一檔案，回傳實際寫出的檔案路徑。
+/// `overwrite` 只對 `Output::File` 有意義：為 false 時，輸出檔已存在就會失敗。
 pub fn decrypt_file(
     input: &Path,
-    output: &Path,
+    output: &Output,
     material: &[u8],
     overwrite: bool,
     progress: &Progress,
-) -> Result<()> {
+) -> Result<PathBuf> {
     let mut r = BufReader::new(File::open(input)?);
     let header = read_header(&mut r)?;
 
     let file_size = std::fs::metadata(input)?.len();
-    let cipher_size = file_size.saturating_sub(header.len);
+    let cipher_size = file_size.saturating_sub(header.raw.len() as u64);
     progress.reset(cipher_size);
 
-    let mut tmp = create_temp_output(input, output, overwrite)?;
+    let out_dir = match output {
+        Output::File(path) => {
+            check_output_path(input, path, overwrite)?;
+            parent_dir(path)
+        }
+        Output::AutoName(dir) => dir.as_path(),
+    };
+    let mut tmp = temp_in(out_dir)?;
 
     let key = derive_key(
         material,
@@ -367,39 +504,54 @@ pub fn decrypt_file(
     let n_chunks = cipher_size.div_ceil(ENC_CHUNK as u64).max(1);
     let mut buf = vec![0u8; ENC_CHUNK];
     let mut processed: u64 = 0;
+    let mut original_name = header.v1_name.clone();
 
     for i in 0..n_chunks {
         if progress.is_cancelled() {
             bail!("使用者已取消");
         }
         let read_n = read_up_to(&mut r, &mut buf)?;
-        let chunk = &buf[..read_n];
-        let plaintext = Zeroizing::new(if i + 1 == n_chunks {
-            dec.take()
-                .unwrap()
-                .decrypt_last(chunk)
-                .map_err(|_| anyhow!(DECRYPT_FAILED))?
-        } else {
-            dec.as_mut()
-                .unwrap()
-                .decrypt_next(chunk)
-                .map_err(|_| anyhow!(DECRYPT_FAILED))?
-        });
-        writer.write_all(&plaintext)?;
+        let payload = Payload {
+            msg: &buf[..read_n],
+            aad: header.aad(),
+        };
+        let plaintext = Zeroizing::new(
+            if i + 1 == n_chunks {
+                dec.take().unwrap().decrypt_last(payload)
+            } else {
+                dec.as_mut().unwrap().decrypt_next(payload)
+            }
+            .map_err(|_| anyhow!(DECRYPT_FAILED))?,
+        );
+        let mut body: &[u8] = &plaintext;
+        if i == 0 && header.version != VERSION_V1 {
+            let (name, rest) = split_name(body)?;
+            original_name = Some(name);
+            body = rest;
+        }
+        writer.write_all(body)?;
         processed += read_n as u64;
         progress.processed.store(processed, Ordering::Relaxed);
     }
 
     writer.flush()?;
     drop(writer);
-    commit_output(tmp, output, overwrite)
+    match output {
+        Output::File(path) => {
+            commit_output(tmp, path, overwrite)?;
+            Ok(path.clone())
+        }
+        Output::AutoName(dir) => {
+            let name = sanitize_file_name(original_name.as_deref().unwrap_or(""));
+            commit_unique(tmp, dir, &name)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
 
     const PW: &[u8] = "正確的密碼".as_bytes();
 
@@ -421,11 +573,31 @@ mod tests {
         .unwrap();
     }
 
-    /// 手工組出只有標頭的加密檔，用來模擬惡意／損毀的檔案。
+    fn decrypt_to(input: &Path, output: &Path, pw: &[u8], overwrite: bool) -> Result<PathBuf> {
+        decrypt_file(
+            input,
+            &Output::File(output.to_path_buf()),
+            pw,
+            overwrite,
+            &Progress::default(),
+        )
+    }
+
+    fn decrypt_auto(input: &Path, dir: &Path) -> Result<PathBuf> {
+        decrypt_file(
+            input,
+            &Output::AutoName(dir.to_path_buf()),
+            PW,
+            false,
+            &Progress::default(),
+        )
+    }
+
+    /// 手工組出只有 v1 標頭的加密檔，用來模擬惡意／損毀的檔案。
     fn craft_header(dir: &Path, name: &str, m: u32, t: u32, p: u32, salt_len: u8) -> PathBuf {
         let mut h = Vec::new();
         h.extend_from_slice(MAGIC);
-        h.extend_from_slice(&[VERSION, ALG_AES256GCM, KEY_SOURCE_PASSWORD]);
+        h.extend_from_slice(&[1, ALG_AES256GCM, KEY_SOURCE_PASSWORD]);
         h.extend_from_slice(&m.to_le_bytes());
         h.extend_from_slice(&t.to_le_bytes());
         h.extend_from_slice(&p.to_le_bytes());
@@ -438,13 +610,22 @@ mod tests {
         write(dir, "crafted.enc", &h)
     }
 
+    /// 把 repo 內的 v1 範例檔複製到暫存目錄（由 v1.0.1 產生，原始檔名「v1 範例.txt」）。
+    fn v1_fixture(dir: &Path) -> PathBuf {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1_sample.enc");
+        let dst = dir.join("v1_sample.enc");
+        fs::copy(src, &dst).unwrap();
+        dst
+    }
+    const V1_CONTENT: &str = "這是 v1 格式的範例內容。\n";
+
     fn roundtrip(data: &[u8]) {
         let dir = tempfile::tempdir().unwrap();
         let input = write(dir.path(), "plain.bin", data);
         let enc = dir.path().join("plain.bin.enc");
         let out = dir.path().join("out.bin");
         encrypt(&input, &enc);
-        decrypt_file(&enc, &out, PW, false, &Progress::default()).unwrap();
+        decrypt_to(&enc, &out, PW, false).unwrap();
         assert_eq!(fs::read(&out).unwrap(), data);
     }
 
@@ -478,23 +659,21 @@ mod tests {
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
         fs::write(&enc, bytes).unwrap();
-        let out = dir.path().join("out.txt");
-        assert!(decrypt_file(&enc, &out, PW, false, &Progress::default()).is_err());
+        assert!(decrypt_to(&enc, &dir.path().join("out.txt"), PW, false).is_err());
     }
 
     #[test]
     fn truncated_at_chunk_boundary_fails() {
         let dir = tempfile::tempdir().unwrap();
-        let input = write(dir.path(), "a.bin", &vec![1u8; PLAIN_CHUNK * 2]);
+        let input = write(dir.path(), "a.bin", &vec![1u8; PLAIN_CHUNK * 3]);
         let enc = dir.path().join("a.bin.enc");
         encrypt(&input, &enc);
         let bytes = fs::read(&enc).unwrap();
         fs::write(&enc, &bytes[..bytes.len() - ENC_CHUNK]).unwrap();
-        let out = dir.path().join("out.bin");
-        assert!(decrypt_file(&enc, &out, PW, false, &Progress::default()).is_err());
+        assert!(decrypt_to(&enc, &dir.path().join("out.bin"), PW, false).is_err());
     }
 
-    // ---- 第 1 點：失敗時不可破壞既有檔案 ----
+    // ---- 失敗時不可破壞既有檔案 ----
 
     #[test]
     fn wrong_password_keeps_existing_output_file() {
@@ -504,8 +683,7 @@ mod tests {
         encrypt(&input, &enc);
         // 使用者保留了原檔（甚至已經改過），然後用錯密碼解密到同一個路徑
         fs::write(&input, b"newer content").unwrap();
-        let res = decrypt_file(&enc, &input, b"wrong", true, &Progress::default());
-        assert!(res.is_err());
+        assert!(decrypt_to(&enc, &input, b"wrong", true).is_err());
         assert_eq!(fs::read(&input).unwrap(), b"newer content");
     }
 
@@ -533,7 +711,7 @@ mod tests {
         let enc = dir.path().join("a.txt.enc");
         encrypt(&input, &enc);
         let out = write(dir.path(), "out.txt", b"old");
-        decrypt_file(&enc, &out, PW, true, &Progress::default()).unwrap();
+        assert_eq!(decrypt_to(&enc, &out, PW, true).unwrap(), out);
         assert_eq!(fs::read(&out).unwrap(), b"data");
     }
 
@@ -560,8 +738,7 @@ mod tests {
         let enc = dir.path().join("a.txt.enc");
         encrypt(&input, &enc);
         fs::remove_file(&input).unwrap();
-        let out = dir.path().join("a.txt");
-        assert!(decrypt_file(&enc, &out, b"wrong", false, &Progress::default()).is_err());
+        assert!(decrypt_to(&enc, &dir.path().join("a.txt"), b"wrong", false).is_err());
         let names: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name())
@@ -569,7 +746,7 @@ mod tests {
         assert_eq!(names, vec![std::ffi::OsString::from("a.txt.enc")]);
     }
 
-    // ---- 第 2 點：標頭檔名不可跳出目錄 ----
+    // ---- 標頭檔名不可跳出目錄 ----
 
     fn peeked_name(name: &str) -> String {
         let dir = tempfile::tempdir().unwrap();
@@ -581,7 +758,7 @@ mod tests {
             ARGON_P_COST,
             16,
         );
-        peek_header(&f).unwrap().original_name
+        peek_header(&f).unwrap().original_name.unwrap()
     }
 
     #[test]
@@ -608,12 +785,12 @@ mod tests {
         assert_eq!(peeked_name("報告 v2.docx"), "報告 v2.docx");
     }
 
-    // ---- 第 3 點：標頭參數上限 ----
+    // ---- 標頭參數上限 ----
 
-    fn decrypt_crafted(m: u32, t: u32, p: u32, salt_len: u8) -> Result<()> {
+    fn decrypt_crafted(m: u32, t: u32, p: u32, salt_len: u8) -> Result<PathBuf> {
         let dir = tempfile::tempdir().unwrap();
         let f = craft_header(dir.path(), "x", m, t, p, salt_len);
-        decrypt_file(&f, &dir.path().join("out"), PW, false, &Progress::default())
+        decrypt_to(&f, &dir.path().join("out"), PW, false)
     }
 
     #[test]
@@ -647,5 +824,140 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let f = craft_header(dir.path(), "x", u32::MAX, 3, 1, 16);
         assert!(peek_header(&f).is_err());
+    }
+
+    // ---- v2：標頭受驗證保護 ----
+
+    #[test]
+    fn new_files_use_version_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write(dir.path(), "a.txt", b"data");
+        let enc = dir.path().join("a.txt.enc");
+        encrypt(&input, &enc);
+        let info = peek_header(&enc).unwrap();
+        assert_eq!(info.version, 2);
+        assert_eq!(info.key_source, KEY_SOURCE_PASSWORD);
+    }
+
+    #[test]
+    fn tampered_header_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write(dir.path(), "a.txt", b"data");
+        let enc = dir.path().join("a.txt.enc");
+        encrypt(&input, &enc);
+        let mut bytes = fs::read(&enc).unwrap();
+        bytes[8] = KEY_SOURCE_KEYFILE; // 竄改「金鑰來源」欄位
+        fs::write(&enc, bytes).unwrap();
+        assert!(decrypt_to(&enc, &dir.path().join("out.txt"), PW, false).is_err());
+    }
+
+    // ---- v2：原始檔名經過加密 ----
+
+    #[test]
+    fn original_name_is_not_stored_in_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write(dir.path(), "2025薪資明細.xlsx", b"data");
+        let enc = dir.path().join("x.enc");
+        encrypt(&input, &enc);
+        let bytes = fs::read(&enc).unwrap();
+        let name = "2025薪資明細".as_bytes();
+        assert!(!bytes.windows(name.len()).any(|w| w == name));
+        assert_eq!(peek_header(&enc).unwrap().original_name, None);
+    }
+
+    #[test]
+    fn auto_name_restores_original_name_after_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let input = write(src.path(), "報告.docx", b"report body");
+        let enc = dir.path().join("renamed.enc");
+        encrypt(&input, &enc);
+        let out = decrypt_auto(&enc, dir.path()).unwrap();
+        assert_eq!(out, dir.path().join("報告.docx"));
+        assert_eq!(fs::read(&out).unwrap(), b"report body");
+    }
+
+    #[test]
+    fn auto_name_never_overwrites_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write(dir.path(), "報告.docx", b"new");
+        let enc = dir.path().join("報告.docx.enc");
+        encrypt(&input, &enc);
+        write(dir.path(), "報告 (1).docx", b"also existing");
+
+        let out = decrypt_auto(&enc, dir.path()).unwrap();
+        assert_eq!(out, dir.path().join("報告 (2).docx"));
+        assert_eq!(fs::read(&out).unwrap(), b"new");
+        assert_eq!(fs::read(dir.path().join("報告.docx")).unwrap(), b"new");
+        assert_eq!(
+            fs::read(dir.path().join("報告 (1).docx")).unwrap(),
+            b"also existing"
+        );
+    }
+
+    #[test]
+    fn auto_name_sanitizes_decrypted_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write(dir.path(), "a.txt", b"payload");
+        let enc = dir.path().join("a.enc");
+        // 持有金鑰的人仍可能在加密內容裡塞入惡意檔名
+        encrypt_with_name(
+            &input,
+            &enc,
+            r"..\..\evil.txt",
+            PW,
+            KEY_SOURCE_PASSWORD,
+            false,
+            &Progress::default(),
+        )
+        .unwrap();
+        let out = decrypt_auto(&enc, dir.path()).unwrap();
+        assert_eq!(out, dir.path().join("evil.txt"));
+    }
+
+    #[test]
+    fn auto_name_failure_leaves_no_files_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write(dir.path(), "a.txt", b"data");
+        let enc = dir.path().join("a.txt.enc");
+        encrypt(&input, &enc);
+        fs::remove_file(&input).unwrap();
+        let res = decrypt_file(
+            &enc,
+            &Output::AutoName(dir.path().into()),
+            b"wrong",
+            false,
+            &Progress::default(),
+        );
+        assert!(res.is_err());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    // ---- v1 相容性 ----
+
+    #[test]
+    fn v1_file_still_decrypts() {
+        let dir = tempfile::tempdir().unwrap();
+        let enc = v1_fixture(dir.path());
+        let out = dir.path().join("out.txt");
+        decrypt_to(&enc, &out, PW, false).unwrap();
+        assert_eq!(fs::read_to_string(&out).unwrap(), V1_CONTENT);
+    }
+
+    #[test]
+    fn v1_header_name_is_visible_before_decrypting() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = peek_header(&v1_fixture(dir.path())).unwrap();
+        assert_eq!(info.version, 1);
+        assert_eq!(info.original_name.as_deref(), Some("v1 範例.txt"));
+    }
+
+    #[test]
+    fn v1_file_auto_name_uses_header_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let enc = v1_fixture(dir.path());
+        let out = decrypt_auto(&enc, dir.path()).unwrap();
+        assert_eq!(out, dir.path().join("v1 範例.txt"));
+        assert_eq!(fs::read_to_string(&out).unwrap(), V1_CONTENT);
     }
 }
