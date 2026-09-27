@@ -199,6 +199,10 @@ file-crypto/
 └─ Cargo.lock
 ```
 
+## 👤 作者
+
+[Allen Yen](https://allenyen.net)
+
 ## 📜 授權
 
 [MIT License](LICENSE)
