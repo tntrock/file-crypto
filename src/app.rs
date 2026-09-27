@@ -1,6 +1,6 @@
 //! egui GUI 應用層
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -104,12 +104,15 @@ impl EncryptorApp {
     }
 
     fn validate(&self) -> Result<Vec<u8>, String> {
-        let Some(_) = &self.input_path else {
+        let Some(input) = &self.input_path else {
             return Err("尚未選擇輸入檔。".into());
         };
-        let Some(_) = &self.output_path else {
+        let Some(output) = &self.output_path else {
             return Err("尚未指定輸出檔。".into());
         };
+        if input == output {
+            return Err("輸出檔不可與輸入檔相同。".into());
+        }
         match self.key_mode {
             KeyMode::Password => {
                 if self.password.is_empty() {
@@ -141,6 +144,15 @@ impl EncryptorApp {
 
         let input = self.input_path.clone().unwrap();
         let output = self.output_path.clone().unwrap();
+
+        // 輸出檔已存在時先詢問；只有成功完成才會真的取代它
+        let overwrite = output.exists();
+        if overwrite && !confirm_overwrite(&output) {
+            material.zeroize();
+            self.status = "已取消：輸出檔已存在。".to_owned();
+            self.is_error = true;
+            return;
+        }
         let mode = self.mode;
         let key_source = match self.key_mode {
             KeyMode::Password => KEY_SOURCE_PASSWORD,
@@ -159,20 +171,19 @@ impl EncryptorApp {
 
         thread::spawn(move || {
             let outcome = match mode {
-                Mode::Encrypt => {
-                    crypto::encrypt_file(&input, &output, &material, key_source, &progress)
+                Mode::Encrypt => crypto::encrypt_file(
+                    &input, &output, &material, key_source, overwrite, &progress,
+                ),
+                Mode::Decrypt => {
+                    crypto::decrypt_file(&input, &output, &material, overwrite, &progress)
                 }
-                Mode::Decrypt => crypto::decrypt_file(&input, &output, &material, &progress),
             };
             material.zeroize();
 
             let msg = match outcome {
                 Ok(()) => Ok(format!("完成！已輸出至：\n{}", output.display())),
-                Err(e) => {
-                    // 失敗時刪除半成品輸出檔，避免留下損毀檔案
-                    let _ = std::fs::remove_file(&output);
-                    Err(format!("失敗：{e}"))
-                }
+                // 半成品只存在於暫存檔，crypto 模組失敗時會自行清除
+                Err(e) => Err(format!("失敗：{e}")),
             };
             *result.lock().unwrap() = Some(msg);
             running.store(false, Ordering::Relaxed);
@@ -354,6 +365,22 @@ impl eframe::App for EncryptorApp {
             ui.colored_label(color, &self.status);
         });
     }
+}
+
+fn confirm_overwrite(output: &Path) -> bool {
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title("輸出檔已存在")
+        .set_description(format!(
+            "以下檔案已存在：
+{}
+
+要在處理成功後覆蓋它嗎？（失敗時不會動到原檔）",
+            output.display()
+        ))
+        .set_buttons(rfd::MessageButtons::YesNo)
+        .show()
+        == rfd::MessageDialogResult::Yes
 }
 
 /// 從 Windows 系統字型載入 CJK 字型，讓中文能正常顯示。
