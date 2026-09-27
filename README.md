@@ -16,10 +16,26 @@
 每個 exe 都由 GitHub Actions 從原始碼自動建置，並附上 `.sha256` 檔供驗證：
 
 ```powershell
-Get-FileHash .\file-crypto-v1.2.0-windows-x64.exe -Algorithm SHA256
+Get-FileHash .\file-crypto-v1.3.0-windows-x64.exe -Algorithm SHA256
 ```
 
 > 首次執行時 Windows SmartScreen 可能會警告「無法辨識的應用程式」，這是因為 exe 沒有程式碼簽章。點「其他資訊 → 仍要執行」即可。
+
+### ⚠️ 官方來源
+
+本程式**唯一的官方來源**是下列 GitHub 頁面：
+
+| 用途 | 網址 |
+|---|---|
+| 原始碼 | https://github.com/tntrock/file-crypto |
+| 官方下載 | https://github.com/tntrock/file-crypto/releases |
+| 問題回報 | https://github.com/tntrock/file-crypto/issues |
+
+- 其他網站、網路硬碟或他人轉傳的檔案，可能已被植入惡意程式，請勿使用。
+- 作者不會透過私訊、Email 或其他管道傳送程式，也不會向你索取密碼或金鑰檔。
+- 程式內按視窗下方的「關於」也能看到這些資訊：
+
+<p align="center"><img src="docs/about.png" alt="關於視窗" width="480"></p>
 
 ## ✨ 功能特色
 
@@ -166,11 +182,13 @@ file-crypto/
 │  ├─ icon.ico       # exe 檔案圖示（多尺寸）
 │  └─ icon.png       # 視窗／工作列圖示（256×256）
 ├─ docs/
-│  └─ screenshot.png
+│  ├─ screenshot.png
+│  └─ about.png
 ├─ src/
 │  ├─ main.rs        # 進入點、視窗設定、載入視窗圖示
-│  ├─ app.rs         # egui GUI 介面與背景工作執行緒
+│  ├─ app.rs         # egui GUI 介面（含「關於」視窗）與背景工作執行緒
 │  ├─ crypto.rs      # AES-256-GCM + Argon2id 核心、檔案格式與單元測試
+│  ├─ project.rs     # 專案資訊：版本、作者、授權、官方網址（取自 Cargo.toml）
 │  └─ update.rs      # 檢查新版本與使用者設定
 ├─ tests/fixtures/
 │  ├─ v1_sample.enc          # v1 格式範例檔（密碼）

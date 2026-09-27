@@ -8,10 +8,11 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 
-/// 目前程式版本（取自 Cargo.toml）。
-pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+use crate::project;
 
-const REPO: &str = "tntrock/file-crypto";
+/// 目前程式版本（取自 Cargo.toml）。
+pub const CURRENT_VERSION: &str = project::VERSION;
+
 const SETTINGS_KEY_AUTO_CHECK: &str = "auto_check_updates";
 
 /// GitHub 上的新版本。
@@ -23,7 +24,7 @@ pub struct Release {
 
 impl Release {
     pub fn page_url(&self) -> String {
-        format!("https://github.com/{REPO}/releases/tag/v{}", self.version)
+        project::release_page_url(&self.version)
     }
 }
 
@@ -57,9 +58,7 @@ pub fn check_latest() -> Result<Option<Release>> {
         .build()
         .into();
     let json = agent
-        .get(format!(
-            "https://api.github.com/repos/{REPO}/releases/latest"
-        ))
+        .get(project::latest_release_api_url())
         .header("Accept", "application/vnd.github+json")
         .call()
         .context("無法連線到 GitHub")?

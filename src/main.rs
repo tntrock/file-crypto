@@ -3,6 +3,7 @@
 
 mod app;
 mod crypto;
+mod project;
 mod update;
 
 use eframe::egui;

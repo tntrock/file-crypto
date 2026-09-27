@@ -9,6 +9,7 @@ use eframe::egui;
 use zeroize::Zeroizing;
 
 use crate::crypto::{self, Output, Progress, Secret, KEY_SOURCE_PASSWORD};
+use crate::project;
 use crate::update::{self, Release, Settings, CURRENT_VERSION};
 
 #[derive(PartialEq, Clone, Copy)]
@@ -75,6 +76,7 @@ pub struct EncryptorApp {
 
     settings: Settings,
     update: Arc<Mutex<UpdateState>>,
+    show_about: bool,
 }
 
 impl EncryptorApp {
@@ -97,6 +99,7 @@ impl EncryptorApp {
             result: Arc::new(Mutex::new(None)),
             settings: Settings::load(),
             update: Arc::new(Mutex::new(UpdateState::Idle)),
+            show_about: false,
         };
         if app.settings.auto_check_updates {
             app.check_for_updates(&cc.egui_ctx, false);
@@ -139,11 +142,72 @@ impl EncryptorApp {
         });
     }
 
+    /// 「關於」視窗：專案與作者資訊，以及唯一的官方下載來源。
+    fn about_window(&mut self, ctx: &egui::Context) {
+        let warn = egui::Color32::from_rgb(230, 170, 40);
+        const VERIFY_CMD: &str = r"Get-FileHash .\file-crypto-*.exe -Algorithm SHA256";
+        egui::Window::new("關於")
+            .open(&mut self.show_about)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.heading("🔐 檔案加解密工具");
+                ui.label(format!("版本 v{}", project::VERSION));
+                ui.label("以 AES-256-GCM + Argon2id 加解密單一檔案的免安裝工具。");
+                ui.separator();
+
+                egui::Grid::new("about_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("作者");
+                        ui.label(project::AUTHORS);
+                        ui.end_row();
+                        ui.label("授權");
+                        ui.label(format!("{} License（開源、免費）", project::LICENSE));
+                        ui.end_row();
+                        ui.label("原始碼");
+                        ui.hyperlink_to(project::REPO_URL, project::REPO_URL);
+                        ui.end_row();
+                        ui.label("官方下載");
+                        ui.hyperlink_to(project::releases_url(), project::releases_url());
+                        ui.end_row();
+                        ui.label("問題回報");
+                        ui.hyperlink_to(project::issues_url(), project::issues_url());
+                        ui.end_row();
+                    });
+                ui.separator();
+
+                ui.label(
+                    egui::RichText::new("⚠ 請只從上方的「官方下載」頁面取得本程式")
+                        .strong()
+                        .color(warn),
+                );
+                ui.label("其他網站、網路硬碟或他人轉傳的檔案，可能已被植入惡意程式。");
+                ui.label("下載後，在 exe 所在資料夾開啟 PowerShell 執行下列指令，");
+                ui.label("比對結果是否與 Release 頁面上的 .sha256 檔一致：");
+                ui.horizontal(|ui| {
+                    ui.code(VERIFY_CMD);
+                    if ui.small_button("複製").clicked() {
+                        ui.output_mut(|o| o.copied_text = VERIFY_CMD.to_owned());
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    "作者不會透過私訊、Email 或其他管道傳送程式，也不會向你索取密碼或金鑰檔。",
+                );
+            });
+    }
+
     /// 最下方的版本資訊與更新設定。
     fn footer(&mut self, ctx: &egui::Context, state: &UpdateState) {
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!("v{CURRENT_VERSION}"));
+                if ui.button("關於").clicked() {
+                    self.show_about = true;
+                }
                 let checking = matches!(state, UpdateState::Checking { .. });
                 if ui
                     .add_enabled(!checking, egui::Button::new("檢查更新"))
@@ -339,6 +403,9 @@ impl eframe::App for EncryptorApp {
             self.update_banner(ctx, release);
         }
         self.footer(ctx, &update_state);
+        if self.show_about {
+            self.about_window(ctx);
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("🔐 檔案加解密工具");
