@@ -1,0 +1,53 @@
+# 推送 v* tag（例如 v1.0.1）時：跑測試 → 編譯 release 版 exe → 附加到同名 GitHub Release
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 確認 tag 與 Cargo.toml 版本一致
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME 與 Cargo.toml 版本 $version 不一致"
+            exit 1
+          fi
+
+      - name: 測試
+        run: cargo test --locked
+
+      - name: 編譯
+        run: cargo build --release --locked
+
+      - name: 打包並計算 SHA-256
+        shell: bash
+        run: |
+          name="file-crypto-${GITHUB_REF_NAME}-windows-x64.exe"
+          mkdir dist
+          cp target/release/file-crypto.exe "dist/$name"
+          cd dist
+          sha256sum "$name" > "$name.sha256"
+          cat "$name.sha256"
+
+      - name: 上傳到 GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
+          fi
