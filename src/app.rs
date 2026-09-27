@@ -9,6 +9,7 @@ use eframe::egui;
 use zeroize::Zeroizing;
 
 use crate::crypto::{self, Output, Progress, Secret, KEY_SOURCE_PASSWORD};
+use crate::update::{self, Release, Settings, CURRENT_VERSION};
 
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {
@@ -40,6 +41,16 @@ impl KeyInput {
 /// 由背景執行緒回報的最終結果。
 type JobResult = Arc<Mutex<Option<Result<String, String>>>>;
 
+/// 檢查更新的狀態，於 GUI 執行緒與檢查執行緒間共享。
+#[derive(Clone)]
+enum UpdateState {
+    Idle,
+    Checking { manual: bool },
+    UpToDate,
+    Available(Release),
+    Failed(String),
+}
+
 pub struct EncryptorApp {
     mode: Mode,
     key_mode: KeyMode,
@@ -61,12 +72,15 @@ pub struct EncryptorApp {
     progress: Arc<Progress>,
     running: Arc<AtomicBool>,
     result: JobResult,
+
+    settings: Settings,
+    update: Arc<Mutex<UpdateState>>,
 }
 
 impl EncryptorApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
-        Self {
+        let app = Self {
             mode: Mode::Encrypt,
             key_mode: KeyMode::Password,
             input_path: None,
@@ -81,7 +95,87 @@ impl EncryptorApp {
             progress: Arc::new(Progress::default()),
             running: Arc::new(AtomicBool::new(false)),
             result: Arc::new(Mutex::new(None)),
+            settings: Settings::load(),
+            update: Arc::new(Mutex::new(UpdateState::Idle)),
+        };
+        if app.settings.auto_check_updates {
+            app.check_for_updates(&cc.egui_ctx, false);
         }
+        app
+    }
+
+    /// 在背景檢查新版本。自動檢查失敗時不打擾使用者，只有手動檢查才顯示結果。
+    fn check_for_updates(&self, ctx: &egui::Context, manual: bool) {
+        *self.update.lock().unwrap() = UpdateState::Checking { manual };
+        let state = self.update.clone();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let next = match update::check_latest() {
+                Ok(Some(release)) => UpdateState::Available(release),
+                Ok(None) if manual => UpdateState::UpToDate,
+                Err(e) if manual => UpdateState::Failed(format!("{e:#}")),
+                _ => UpdateState::Idle,
+            };
+            *state.lock().unwrap() = next;
+            ctx.request_repaint();
+        });
+    }
+
+    /// 有新版時顯示在最上方的提示列。
+    fn update_banner(&self, ctx: &egui::Context, release: &Release) {
+        egui::TopBottomPanel::top("update_banner").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(230, 170, 40),
+                    format!(
+                        "🎉 有新版本 v{}（目前 v{CURRENT_VERSION}）",
+                        release.version
+                    ),
+                );
+                if ui.button("前往下載").clicked() {
+                    ctx.open_url(egui::OpenUrl::new_tab(release.page_url()));
+                }
+            });
+        });
+    }
+
+    /// 最下方的版本資訊與更新設定。
+    fn footer(&mut self, ctx: &egui::Context, state: &UpdateState) {
+        egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(format!("v{CURRENT_VERSION}"));
+                let checking = matches!(state, UpdateState::Checking { .. });
+                if ui
+                    .add_enabled(!checking, egui::Button::new("檢查更新"))
+                    .clicked()
+                {
+                    self.check_for_updates(ctx, true);
+                }
+                if ui
+                    .checkbox(&mut self.settings.auto_check_updates, "啟動時自動檢查更新")
+                    .changed()
+                {
+                    if let Err(e) = self.settings.save() {
+                        self.status = format!("無法儲存設定：{e}");
+                        self.is_error = true;
+                    }
+                }
+                match state {
+                    UpdateState::Checking { manual: true } => {
+                        ui.spinner();
+                        ui.label("檢查中…");
+                    }
+                    UpdateState::UpToDate => {
+                        ui.label("已是最新版本");
+                    }
+                    UpdateState::Failed(e) => {
+                        ui.colored_label(egui::Color32::from_rgb(200, 60, 60), "檢查失敗")
+                            .on_hover_text(e);
+                    }
+                    _ => {}
+                }
+            });
+        });
     }
 
     /// 依模式與輸入檔，推算預設輸出位置。
@@ -239,6 +333,12 @@ impl eframe::App for EncryptorApp {
             }
         }
         let running = self.running.load(Ordering::Relaxed);
+
+        let update_state = self.update.lock().unwrap().clone();
+        if let UpdateState::Available(release) = &update_state {
+            self.update_banner(ctx, release);
+        }
+        self.footer(ctx, &update_state);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("🔐 檔案加解密工具");
