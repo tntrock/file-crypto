@@ -13,7 +13,7 @@ eframe = "0.27"
 rfd = "0.14"
 aes-gcm = { version = "0.10", features = ["stream"] }
 argon2 = "0.5"
-rand = "0.8"
+rand = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 anyhow = "1"
 blake2 = "0.10"
