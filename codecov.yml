@@ -1,0 +1,9 @@
+# 覆蓋率只做參考，不讓 Codecov 的狀態檢查擋住 PR
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true

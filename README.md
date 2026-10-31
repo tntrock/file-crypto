@@ -1,8 +1,13 @@
 # 檔案加解密工具（Rust + egui）
 
-[![CI](https://github.com/tntrock/file-crypto/actions/workflows/ci.yml/badge.svg)](https://github.com/tntrock/file-crypto/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/tntrock/file-crypto)](https://github.com/tntrock/file-crypto/releases/latest)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://img.shields.io/github/actions/workflow/status/tntrock/file-crypto/ci.yml?branch=main&label=CI&logo=githubactions&logoColor=white)](https://github.com/tntrock/file-crypto/actions/workflows/ci.yml)
+[![Codecov](https://img.shields.io/codecov/c/github/tntrock/file-crypto?logo=codecov&logoColor=white)](https://codecov.io/gh/tntrock/file-crypto)
+[![Release](https://img.shields.io/github/v/release/tntrock/file-crypto?logo=github)](https://github.com/tntrock/file-crypto/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/tntrock/file-crypto/total?logo=github)](https://github.com/tntrock/file-crypto/releases)
+[![License: MIT](https://img.shields.io/github/license/tntrock/file-crypto)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-2021-orange?logo=rust)](https://www.rust-lang.org/)
+[![Platform](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white)](https://github.com/tntrock/file-crypto/releases/latest)
+[![Dependabot](https://img.shields.io/badge/Dependabot-enabled-025E8C?logo=dependabot)](https://github.com/tntrock/file-crypto/security/dependabot)
 
 一個 Windows 桌面 GUI 工具，用來對檔案做加密與解密，**可一次處理多個檔案**。
 介面純中文、免安裝、可攜。
