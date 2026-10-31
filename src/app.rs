@@ -136,8 +136,8 @@ impl EncryptorApp {
     }
 
     /// 有新版時顯示在最上方的提示列。
-    fn update_banner(&self, ctx: &egui::Context, release: &Release) {
-        egui::TopBottomPanel::top("update_banner").show(ctx, |ui| {
+    fn update_banner(&self, ui: &mut egui::Ui, release: &Release) {
+        egui::Panel::top("update_banner").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.colored_label(
                     egui::Color32::from_rgb(230, 170, 40),
@@ -147,7 +147,8 @@ impl EncryptorApp {
                     ),
                 );
                 if ui.button("前往下載").clicked() {
-                    ctx.open_url(egui::OpenUrl::new_tab(release.page_url()));
+                    ui.ctx()
+                        .open_url(egui::OpenUrl::new_tab(release.page_url()));
                 }
             });
         });
@@ -202,7 +203,7 @@ impl EncryptorApp {
                 ui.horizontal(|ui| {
                     ui.code(VERIFY_CMD);
                     if ui.small_button("複製").clicked() {
-                        ui.output_mut(|o| o.copied_text = VERIFY_CMD.to_owned());
+                        ui.ctx().copy_text(VERIFY_CMD.to_owned());
                     }
                 });
                 ui.add_space(4.0);
@@ -213,8 +214,8 @@ impl EncryptorApp {
     }
 
     /// 最下方的版本資訊與更新設定。
-    fn footer(&mut self, ctx: &egui::Context, state: &UpdateState) {
-        egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
+    fn footer(&mut self, ui: &mut egui::Ui, state: &UpdateState) {
+        egui::Panel::bottom("footer").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!("v{CURRENT_VERSION}"));
                 if ui.button("關於").clicked() {
@@ -225,7 +226,7 @@ impl EncryptorApp {
                     .add_enabled(!checking, egui::Button::new("檢查更新"))
                     .clicked()
                 {
-                    self.check_for_updates(ctx, true);
+                    self.check_for_updates(ui.ctx(), true);
                 }
                 if ui
                     .checkbox(&mut self.settings.auto_check_updates, "啟動時自動檢查更新")
@@ -502,7 +503,8 @@ impl EncryptorApp {
 }
 
 impl eframe::App for EncryptorApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &ui.ctx().clone();
         // 收取背景結果
         if let Some(res) = self.result.lock().unwrap().take() {
             match res {
@@ -523,7 +525,7 @@ impl eframe::App for EncryptorApp {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|f| f.path.clone())
+                .map(|f| f.path().to_path_buf())
                 .collect()
         });
         if !dropped.is_empty() && !running {
@@ -535,14 +537,14 @@ impl eframe::App for EncryptorApp {
 
         let update_state = self.update.lock().unwrap().clone();
         if let UpdateState::Available(release) = &update_state {
-            self.update_banner(ctx, release);
+            self.update_banner(ui, release);
         }
-        self.footer(ctx, &update_state);
+        self.footer(ui, &update_state);
         if self.show_about {
             self.about_window(ctx);
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("🔐 檔案加解密工具");
             ui.label("AES-256-GCM ｜ 支援多檔案 ｜ 免安裝可攜版");
             ui.separator();
@@ -790,13 +792,13 @@ fn paint_drop_overlay(ctx: &egui::Context) {
         egui::Order::Foreground,
         egui::Id::new("drop_overlay"),
     ));
-    let rect = ctx.screen_rect();
+    let rect = ctx.content_rect();
     painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(190));
     painter.text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         "放開滑鼠以加入檔案",
-        egui::TextStyle::Heading.resolve(&ctx.style()),
+        egui::TextStyle::Heading.resolve(&ctx.global_style()),
         egui::Color32::WHITE,
     );
 }
@@ -834,7 +836,7 @@ fn install_cjk_font(ctx: &egui::Context) {
             let mut fonts = egui::FontDefinitions::default();
             fonts
                 .font_data
-                .insert("cjk".to_owned(), egui::FontData::from_owned(bytes));
+                .insert("cjk".to_owned(), egui::FontData::from_owned(bytes).into());
             fonts
                 .families
                 .entry(egui::FontFamily::Proportional)
