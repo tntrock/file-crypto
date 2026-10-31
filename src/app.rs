@@ -790,7 +790,7 @@ impl eframe::App for EncryptorApp {
 fn paint_drop_overlay(ctx: &egui::Context) {
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
-        egui::Id::new("drop_overlay"),
+        egui::Id::unique("drop_overlay"),
     ));
     let rect = ctx.content_rect();
     painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(190));
