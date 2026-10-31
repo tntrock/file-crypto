@@ -37,7 +37,7 @@ use aes_gcm::{Aes256Gcm, KeyInit};
 use anyhow::{anyhow, bail, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use blake2::{Blake2b512, Digest};
-use rand::RngCore;
+use rand::{Rng, TryRng};
 use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
 
@@ -456,7 +456,7 @@ fn encrypt_with_name(
     // 產生隨機 salt 與 nonce 前綴
     let mut salt = [0u8; SALT_LEN];
     let mut nonce_prefix = [0u8; 7];
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     rng.fill_bytes(&mut salt);
     rng.fill_bytes(&mut nonce_prefix);
 
@@ -624,7 +624,9 @@ pub fn generate_keyfile(path: &Path) -> Result<()> {
         Err(e) => bail!("無法建立金鑰檔 {}: {e}", path.display()),
     };
     let mut key = Zeroizing::new([0u8; GENERATED_KEYFILE_LEN]);
-    rand::rngs::OsRng.fill_bytes(key.as_mut());
+    rand::rngs::SysRng
+        .try_fill_bytes(key.as_mut())
+        .map_err(|e| anyhow!("無法取得系統亂數：{e}"))?;
     let written = file.write_all(key.as_ref()).and_then(|()| file.sync_all());
     drop(file);
     if let Err(e) = written {

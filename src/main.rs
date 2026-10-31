@@ -25,6 +25,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "檔案加解密工具",
         native_options,
-        Box::new(|cc| Box::new(app::EncryptorApp::new(cc))),
+        Box::new(|cc| Ok(Box::new(app::EncryptorApp::new(cc)))),
     )
 }
