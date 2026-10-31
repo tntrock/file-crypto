@@ -10,7 +10,7 @@ build = "build.rs"
 
 [dependencies]
 eframe = "0.27"
-rfd = "0.14"
+rfd = "0.17"
 aes-gcm = { version = "0.10", features = ["stream"] }
 argon2 = "0.5"
 rand = "0.8"
