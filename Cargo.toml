@@ -9,7 +9,7 @@ description = "以 AES-256-GCM + Argon2id 加解密檔案（支援批次）的 W
 build = "build.rs"
 
 [dependencies]
-eframe = "0.36"
+eframe = "0.37"
 rfd = "0.17"
 aes-gcm = { version = "0.10", features = ["stream"] }
 argon2 = "0.6"

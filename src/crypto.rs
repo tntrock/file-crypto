@@ -37,7 +37,7 @@ use aes_gcm::{Aes256Gcm, KeyInit};
 use anyhow::{anyhow, bail, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use blake2::{Blake2b512, Digest};
-use rand::{Rng, TryRng};
+use rand::{RngExt, TryRng};
 use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
 
@@ -454,11 +454,9 @@ fn encrypt_with_name(
     let mut tmp = temp_in(out_dir)?;
 
     // 產生隨機 salt 與 nonce 前綴
-    let mut salt = [0u8; SALT_LEN];
-    let mut nonce_prefix = [0u8; 7];
     let mut rng = rand::rng();
-    rng.fill_bytes(&mut salt);
-    rng.fill_bytes(&mut nonce_prefix);
+    let salt: [u8; SALT_LEN] = rng.random();
+    let nonce_prefix: [u8; 7] = rng.random();
 
     let key = derive_key(&material, &salt, ARGON_M_COST, ARGON_T_COST, ARGON_P_COST)?;
     let header = build_header(key_source, &salt, &nonce_prefix);
