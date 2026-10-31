@@ -13,7 +13,7 @@ jobs:
   test:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt, llvm-tools-preview
@@ -26,7 +26,7 @@ jobs:
       - name: 測試（同時量測覆蓋率）
         run: cargo llvm-cov --locked --lcov --output-path lcov.info
       - name: 上傳覆蓋率到 Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: lcov.info
           disable_search: true
