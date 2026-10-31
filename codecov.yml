@@ -1,4 +1,4 @@
-# 覆蓋率只做參考，不讓 Codecov 的狀態檢查擋住 PR
+# Coverage is informational only; never block PRs. Keep this file ASCII: the Codecov CLI on Windows reads it as cp1252.
 coverage:
   status:
     project:
