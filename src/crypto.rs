@@ -1175,6 +1175,22 @@ mod tests {
     }
 
     #[test]
+    fn keyfile_digest_matches_rfc7693_test_vector() {
+        // 固定答案：升級 blake2 後若結果改變，舊的金鑰檔加密檔就會解不開
+        let dir = tempfile::tempdir().unwrap();
+        let kf = write(dir.path(), "abc.bin", b"abc");
+        let hex: String = hash_keyfile(&kf)
+            .unwrap()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            hex,
+            "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d17d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923"
+        );
+    }
+
+    #[test]
     fn legacy_raw_keyfile_file_still_decrypts() {
         // 由 v1.1.0 以「金鑰來源 = 1（直接使用金鑰檔內容）」產生
         let dir = tempfile::tempdir().unwrap();
